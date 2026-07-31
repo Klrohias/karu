@@ -60,7 +60,15 @@ impl<T> Deref for StateRead<'_, T> {
     }
 }
 
-pub fn remember_state<T: 'static>(
+pub fn remember_state<T: 'static>(initializer: impl FnOnce() -> T) -> State<T> {
+    State {
+        value: Rc::new(RefCell::new(initializer())),
+        invalidation: InvalidationHandle::detached(),
+    }
+}
+
+#[doc(hidden)]
+pub fn __karu_remember_state<T: 'static>(
     composer: &mut Composer,
     initializer: impl FnOnce() -> T,
 ) -> State<T> {

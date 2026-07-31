@@ -27,11 +27,18 @@ pub use renderer::{
     HeadlessOutput, HeadlessRenderer, ImageId, RenderCommand, RenderTree, Renderer, TextStyle,
 };
 pub use state::{State, StateRead, remember_state};
-pub use ui::{Column, Column_with_modifier, Text, Text_with_modifier};
+pub use ui::{Column, ColumnWithModifier, Row, RowWithModifier, Text, TextWithModifier};
 
 #[doc(hidden)]
 pub mod __private {
     pub use crate::composition::with_component_scope;
-    pub use crate::state::remember_state;
-    pub use crate::ui::{Column, Column_with_modifier, Text, Text_with_modifier};
+    pub use crate::state::__karu_remember_state as remember_state;
+    pub use crate::ui::{
+        __karu_Column, __karu_Column as Column,
+        __karu_ColumnWithModifier,
+        __karu_Row, __karu_Row as Row,
+        __karu_RowWithModifier,
+        __karu_Text, __karu_Text as Text,
+        __karu_TextWithModifier,
+    };
 }

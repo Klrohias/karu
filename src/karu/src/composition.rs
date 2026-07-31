@@ -218,6 +218,13 @@ impl InvalidationHandle {
         Self { state, scope }
     }
 
+    pub(crate) fn detached() -> Self {
+        Self::new(
+            Rc::new(InvalidationState::new(CompositionId(0))),
+            RecomposeScopeId(Vec::new()),
+        )
+    }
+
     pub(crate) fn invalidate(&self) {
         self.state.invalidate(self.scope.clone());
     }

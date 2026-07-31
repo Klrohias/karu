@@ -143,6 +143,9 @@ fn layout_element(element: &Element, origin: Offset, constraints: Constraints) -
         ElementKind::Root | ElementKind::Column | ElementKind::Component(_) => {
             layout_vertical_children(&element.children, child_origin, child_constraints)
         }
+        ElementKind::Row => {
+            layout_horizontal_children(&element.children, child_origin, child_constraints)
+        }
         ElementKind::Text(_) | ElementKind::Custom(_) => Vec::new(),
     };
 
@@ -151,19 +154,29 @@ fn layout_element(element: &Element, origin: Offset, constraints: Constraints) -
 
     if matches!(
         element.kind,
-        ElementKind::Root | ElementKind::Column | ElementKind::Component(_)
+        ElementKind::Root | ElementKind::Column | ElementKind::Row | ElementKind::Component(_)
     ) {
         if data.fill_max_width {
             let available = constraints.max_width;
             if available.is_finite() {
-                children = layout_vertical_children(
-                    &element.children,
-                    child_origin,
-                    Constraints {
-                        max_width: available - data.padding.horizontal(),
-                        ..child_constraints
-                    },
-                );
+                children = match element.kind {
+                    ElementKind::Row => layout_horizontal_children(
+                        &element.children,
+                        child_origin,
+                        Constraints {
+                            max_width: available - data.padding.horizontal(),
+                            ..child_constraints
+                        },
+                    ),
+                    _ => layout_vertical_children(
+                        &element.children,
+                        child_origin,
+                        Constraints {
+                            max_width: available - data.padding.horizontal(),
+                            ..child_constraints
+                        },
+                    ),
+                };
             }
         }
     }
@@ -196,6 +209,23 @@ fn layout_vertical_children(
     nodes
 }
 
+fn layout_horizontal_children(
+    children: &[Element],
+    origin: Offset,
+    constraints: Constraints,
+) -> Vec<LayoutNode> {
+    let mut cursor_x = origin.x;
+    let mut nodes = Vec::with_capacity(children.len());
+
+    for child in children {
+        let node = layout_element(child, Offset::new(cursor_x, origin.y), constraints);
+        cursor_x += node.bounds.size.width;
+        nodes.push(node);
+    }
+
+    nodes
+}
+
 fn intrinsic_size(element: &Element, children: &[LayoutNode]) -> Size {
     match &element.kind {
         ElementKind::Text(text) => Size::new(text.len() as f32 * 8.0, 20.0),
@@ -206,6 +236,14 @@ fn intrinsic_size(element: &Element, children: &[LayoutNode]) -> Size {
                 .map(|child| child.bounds.size.width)
                 .fold(0.0, f32::max);
             let height = children.iter().map(|child| child.bounds.size.height).sum();
+            Size::new(width, height)
+        }
+        ElementKind::Row => {
+            let width = children.iter().map(|child| child.bounds.size.width).sum();
+            let height = children
+                .iter()
+                .map(|child| child.bounds.size.height)
+                .fold(0.0, f32::max);
             Size::new(width, height)
         }
     }

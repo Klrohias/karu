@@ -1,5 +1,4 @@
-#[allow(unused_imports)]
-use karu::{App, Column, Text, composable, mangled_composable, remember_state};
+use karu::{App, Column, Row, Text, composable, mangled_composable, remember_state};
 use karu_backend_quad::Quad;
 
 #[composable]
@@ -14,6 +13,15 @@ fn TodoApp() {
     Column(|| {
         for (idx, todo) in todos.iter().enumerate() {
             TodoItem(todo, idx as i32);
+        }
+    });
+
+    Column(|| {
+        for todo in todos.iter() {
+            Row(|| {
+                Text(format!("何意味1：{todo}"));
+                Text(format!("何意味2：{todo}"));
+            });
         }
     });
 }

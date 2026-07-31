@@ -12,6 +12,7 @@ pub struct CustomElement {
 pub enum ElementKind {
     Root,
     Column,
+    Row,
     Text(String),
     Component(&'static str),
     Custom(CustomElement),

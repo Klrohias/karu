@@ -46,11 +46,16 @@ fn remember_state_survives_explicit_recompose() {
 }
 
 #[test]
-fn composable_macro_keeps_original_function_as_empty_stub() {
+fn composable_macro_keeps_original_function_body() {
     let state_out = Rc::new(RefCell::new(None));
     CounterApp(state_out.clone());
 
-    assert!(state_out.borrow().is_none());
+    let state = state_out
+        .borrow()
+        .as_ref()
+        .expect("original body exposed state")
+        .clone();
+    assert_eq!(state.get(), 1);
 }
 
 #[composable]
