@@ -9,7 +9,7 @@ mod ui;
 
 extern crate self as karu;
 
-pub use karu_macros::composable;
+pub use karu_macros::{composable, mangled_composable};
 
 pub use app::{App, AppBackend, AppConfig, AppRoot};
 pub use composition::{

@@ -2,7 +2,7 @@
 use karu::{
     App, AppBackend, AppConfig, AppRoot, Color, Column, Column_with_modifier, Composer,
     Composition, Constraints, ElementKind, Modifier, RecomposeRequest, RenderCommand, State, Text,
-    Text_with_modifier, composable, remember_state,
+    Text_with_modifier, composable, mangled_composable, remember_state,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -19,7 +19,9 @@ fn remember_state_survives_explicit_recompose() {
     let state_out = Rc::new(RefCell::new(None));
     let mut composition = {
         let state_out = state_out.clone();
-        Composition::new(move |__composer| __karu_CounterApp(__composer, state_out.clone()))
+        Composition::new(move |__composer| {
+            mangled_composable!(CounterApp)(__composer, state_out.clone())
+        })
     };
 
     let first = composition.compose();
@@ -72,7 +74,11 @@ fn state_updates_enqueue_recompose_requests_without_running_root() {
         let state_out = state_out.clone();
         let render_count = render_count.clone();
         Composition::new(move |__composer| {
-            __karu_CountingCounterApp(__composer, state_out.clone(), render_count.clone())
+            mangled_composable!(CountingCounterApp)(
+                __composer,
+                state_out.clone(),
+                render_count.clone(),
+            )
         })
     };
 
@@ -129,7 +135,9 @@ fn list_items_reuse_nodes_by_position() {
     let state_out = Rc::new(RefCell::new(None));
     let mut composition = {
         let state_out = state_out.clone();
-        Composition::new(move |__composer| __karu_TodoApp(__composer, state_out.clone()))
+        Composition::new(move |__composer| {
+            mangled_composable!(TodoApp)(__composer, state_out.clone())
+        })
     };
 
     let first = composition.compose();
@@ -169,8 +177,8 @@ fn StyledLayout() {
 
 #[test]
 fn modifiers_affect_layout_and_render_commands() {
-    let mut composition =
-        Composition::new(__karu_StyledLayout).with_constraints(Constraints::loose(100.0, 100.0));
+    let mut composition = Composition::new(mangled_composable!(StyledLayout))
+        .with_constraints(Constraints::loose(100.0, 100.0));
 
     let result = composition.compose();
     let column = &result.render_tree.root.children[0];
@@ -199,7 +207,9 @@ fn composition_tree_records_component_boundaries() {
     let state_out = Rc::new(RefCell::new(None));
     let mut composition = {
         let state_out = state_out.clone();
-        Composition::new(move |__composer| __karu_CounterApp(__composer, state_out.clone()))
+        Composition::new(move |__composer| {
+            mangled_composable!(CounterApp)(__composer, state_out.clone())
+        })
     };
 
     let result = composition.compose();
@@ -255,7 +265,7 @@ fn app_builder_runs_composable_root_with_backend() {
         .title("Karu Test")
         .size(320, 240)
         .build()
-        .run(__karu_AppRootComponent);
+        .run(mangled_composable!(AppRootComponent));
 
     let state = state.borrow();
     let config = state.config.as_ref().expect("backend received app config");

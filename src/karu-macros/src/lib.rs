@@ -1,7 +1,7 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::visit_mut::{self, VisitMut};
-use syn::{Expr, ExprCall, ExprPath, ItemFn, LitStr, parse_macro_input, parse_quote};
+use syn::{Expr, ExprCall, ExprPath, ItemFn, LitStr, Path, parse_macro_input, parse_quote};
 
 #[proc_macro_attribute]
 pub fn composable(_attr: TokenStream, input: TokenStream) -> TokenStream {
@@ -46,6 +46,19 @@ pub fn composable(_attr: TokenStream, input: TokenStream) -> TokenStream {
         }
     }
     .into()
+}
+
+#[proc_macro]
+pub fn mangled_composable(input: TokenStream) -> TokenStream {
+    let mut path = parse_macro_input!(input as Path);
+    let Some(segment) = path.segments.last_mut() else {
+        return syn::Error::new_spanned(path, "expected a composable function path")
+            .to_compile_error()
+            .into();
+    };
+
+    segment.ident = format_ident!("__karu_{}", segment.ident);
+    quote!(#path).into()
 }
 
 struct ComposerInjector;
