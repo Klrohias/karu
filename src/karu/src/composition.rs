@@ -101,6 +101,11 @@ impl Composition {
         self
     }
 
+    pub fn set_constraints(&mut self, constraints: Constraints) -> &mut Self {
+        self.constraints = constraints;
+        self
+    }
+
     pub fn compose(&mut self) -> CompositionResult {
         self.run()
     }

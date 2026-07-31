@@ -1,7 +1,8 @@
 #[allow(unused_imports)]
 use karu::{
-    Color, Column, Column_with_modifier, Composition, Constraints, ElementKind, Modifier,
-    RecomposeRequest, RenderCommand, State, Text, Text_with_modifier, composable, remember_state,
+    App, AppBackend, AppConfig, AppRoot, Color, Column, Column_with_modifier, Composer,
+    Composition, Constraints, ElementKind, Modifier, RecomposeRequest, RenderCommand, State, Text,
+    Text_with_modifier, composable, remember_state,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -18,7 +19,7 @@ fn remember_state_survives_explicit_recompose() {
     let state_out = Rc::new(RefCell::new(None));
     let mut composition = {
         let state_out = state_out.clone();
-        Composition::new(move |__composer| CounterApp(__composer, state_out.clone()))
+        Composition::new(move |__composer| __karu_CounterApp(__composer, state_out.clone()))
     };
 
     let first = composition.compose();
@@ -42,6 +43,14 @@ fn remember_state_survives_explicit_recompose() {
     assert!(!composition.is_dirty());
 }
 
+#[test]
+fn composable_macro_keeps_original_function_as_empty_stub() {
+    let state_out = Rc::new(RefCell::new(None));
+    CounterApp(state_out.clone());
+
+    assert!(state_out.borrow().is_none());
+}
+
 #[composable]
 fn CountingCounterApp(
     state_out: Rc<RefCell<Option<State<i32>>>>,
@@ -63,7 +72,7 @@ fn state_updates_enqueue_recompose_requests_without_running_root() {
         let state_out = state_out.clone();
         let render_count = render_count.clone();
         Composition::new(move |__composer| {
-            CountingCounterApp(__composer, state_out.clone(), render_count.clone())
+            __karu_CountingCounterApp(__composer, state_out.clone(), render_count.clone())
         })
     };
 
@@ -120,7 +129,7 @@ fn list_items_reuse_nodes_by_position() {
     let state_out = Rc::new(RefCell::new(None));
     let mut composition = {
         let state_out = state_out.clone();
-        Composition::new(move |__composer| TodoApp(__composer, state_out.clone()))
+        Composition::new(move |__composer| __karu_TodoApp(__composer, state_out.clone()))
     };
 
     let first = composition.compose();
@@ -161,7 +170,7 @@ fn StyledLayout() {
 #[test]
 fn modifiers_affect_layout_and_render_commands() {
     let mut composition =
-        Composition::new(StyledLayout).with_constraints(Constraints::loose(100.0, 100.0));
+        Composition::new(__karu_StyledLayout).with_constraints(Constraints::loose(100.0, 100.0));
 
     let result = composition.compose();
     let column = &result.render_tree.root.children[0];
@@ -190,7 +199,7 @@ fn composition_tree_records_component_boundaries() {
     let state_out = Rc::new(RefCell::new(None));
     let mut composition = {
         let state_out = state_out.clone();
-        Composition::new(move |__composer| CounterApp(__composer, state_out.clone()))
+        Composition::new(move |__composer| __karu_CounterApp(__composer, state_out.clone()))
     };
 
     let result = composition.compose();
@@ -207,6 +216,53 @@ fn runtime_has_no_thread_local_current_composer_path() {
     assert!(!composition_source.contains("thread_local!"));
     assert!(!composition_source.contains("CURRENT_COMPOSER"));
     assert!(!composition_source.contains("run_in_current_scope"));
+}
+
+#[derive(Clone, Default)]
+struct MockAppBackend {
+    state: Rc<RefCell<MockAppState>>,
+}
+
+#[derive(Default)]
+struct MockAppState {
+    config: Option<AppConfig>,
+    commands: Vec<RenderCommand>,
+}
+
+impl AppBackend for MockAppBackend {
+    fn run(self, mut root: AppRoot, config: AppConfig) {
+        let mut composition = Composition::new(move |composer: &mut Composer| root(composer));
+        let result = composition.compose();
+        let mut state = self.state.borrow_mut();
+        state.config = Some(config);
+        state.commands = result.commands;
+    }
+}
+
+#[composable]
+fn AppRootComponent() {
+    Text("hello app");
+}
+
+#[test]
+fn app_builder_runs_composable_root_with_backend() {
+    let state = Rc::new(RefCell::new(MockAppState::default()));
+
+    App::builder()
+        .with_renderer(MockAppBackend {
+            state: state.clone(),
+        })
+        .title("Karu Test")
+        .size(320, 240)
+        .build()
+        .run(__karu_AppRootComponent);
+
+    let state = state.borrow();
+    let config = state.config.as_ref().expect("backend received app config");
+    assert_eq!(config.title, "Karu Test");
+    assert_eq!(config.width, 320);
+    assert_eq!(config.height, 240);
+    assert_eq!(text_value(only_text_command(&state.commands)), "hello app");
 }
 
 fn only_text_command(commands: &[RenderCommand]) -> &RenderCommand {

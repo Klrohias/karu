@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 karu = { path = "../karu" }
+karu-backend-quad = { path = "../karu-backend-quad", features = ["font-kit"] }

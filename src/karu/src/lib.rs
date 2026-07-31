@@ -1,3 +1,4 @@
+mod app;
 mod composition;
 mod element;
 mod layout;
@@ -10,6 +11,7 @@ extern crate self as karu;
 
 pub use karu_macros::composable;
 
+pub use app::{App, AppBackend, AppConfig, AppRoot};
 pub use composition::{
     Composer, Composition, CompositionError, CompositionId, CompositionResult, RecomposeCallback,
     RecomposeRequest, RecomposeScopeId, with_component_scope,

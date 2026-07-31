@@ -17,19 +17,31 @@ pub fn composable(_attr: TokenStream, input: TokenStream) -> TokenStream {
     }
 
     let attrs = function.attrs;
+    let hidden_attrs = attrs.clone();
     let vis = function.vis;
-    let mut sig = function.sig;
-    let name = LitStr::new(&sig.ident.to_string(), sig.ident.span());
+    let original_sig = function.sig;
+    let hidden_ident = format_ident!("__karu_{}", original_sig.ident);
+    let name = LitStr::new(&original_sig.ident.to_string(), original_sig.ident.span());
+    let mut hidden_sig = original_sig.clone();
     let mut block = function.block;
 
-    sig.inputs
+    hidden_sig.ident = hidden_ident;
+    hidden_sig
+        .inputs
         .insert(0, parse_quote!(__composer: &mut ::karu::Composer));
     ComposerInjector.visit_block_mut(&mut block);
 
     quote! {
         #(#attrs)*
         #[allow(non_snake_case)]
-        #vis #sig {
+        #[allow(dead_code, unused_variables)]
+        #vis #original_sig {
+        }
+
+        #[doc(hidden)]
+        #[allow(non_snake_case)]
+        #(#hidden_attrs)*
+        #vis #hidden_sig {
             ::karu::__private::with_component_scope(__composer, #name, |__composer| #block)
         }
     }
@@ -70,6 +82,7 @@ impl VisitMut for ComposerInjector {
                 inject_composer(call);
             }
             _ if is_component_name(&name) => {
+                replace_with_hidden_component_call(call, &name);
                 inject_composer(call);
             }
             _ => {}
@@ -97,6 +110,16 @@ fn replace_with_private_call(call: &mut ExprCall, function: &str) {
 
 fn inject_composer(call: &mut ExprCall) {
     call.args.insert(0, parse_quote!(__composer));
+}
+
+fn replace_with_hidden_component_call(call: &mut ExprCall, name: &str) {
+    let Expr::Path(ExprPath { path, .. }) = call.func.as_mut() else {
+        return;
+    };
+
+    if let Some(segment) = path.segments.last_mut() {
+        segment.ident = format_ident!("__karu_{name}");
+    }
 }
 
 fn rewrite_child_closure(child: Option<&mut Expr>) {

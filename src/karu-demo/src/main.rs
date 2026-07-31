@@ -1,5 +1,6 @@
 #[allow(unused_imports)]
-use karu::{Column, Composition, Text, composable, remember_state};
+use karu::{App, Column, Text, composable, remember_state};
+use karu_backend_quad::Quad;
 
 #[composable]
 fn TodoItem(todo: String) {
@@ -8,7 +9,7 @@ fn TodoItem(todo: String) {
 
 #[composable]
 fn TodoApp() {
-    let todos = remember_state(|| vec!["write runtime".to_string(), "test renderer".to_string()]);
+    let todos = remember_state(|| vec!["what's going on?".to_string(), "hyw".to_string()]);
 
     Column(|| {
         for todo in todos.iter() {
@@ -18,7 +19,9 @@ fn TodoApp() {
 }
 
 fn main() {
-    let mut composition = Composition::new(TodoApp);
-    let result = composition.compose();
-    println!("{:#?}", result.commands);
+    App::builder()
+        .with_renderer(Quad.system_font(""))
+        .title("Karu Quad Demo")
+        .build()
+        .run(__karu_TodoApp);
 }
