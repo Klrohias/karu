@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 karu-macros = { path = "../karu-macros" }
+unicode-segmentation = "1.12"

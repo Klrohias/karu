@@ -13,6 +13,7 @@ pub enum ElementKind {
     Root,
     Column,
     Row,
+    Box,
     Text(String),
     Component(&'static str),
     Custom(CustomElement),

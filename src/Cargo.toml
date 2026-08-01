@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "karu",
+    "karu-basic",
     "karu-backend-quad",
     "karu-macros",
     "karu-demo",

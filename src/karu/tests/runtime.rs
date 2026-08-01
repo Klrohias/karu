@@ -1,27 +1,30 @@
 #[allow(unused_imports)]
 use karu::{
-    App, AppBackend, AppConfig, AppRoot, Color, Column, Column_with_modifier, Composer,
-    Composition, Constraints, ElementKind, Modifier, RecomposeRequest, RenderCommand, State, Text,
-    Text_with_modifier, composable, mangled_composable, remember_state,
+    Animatable, App, AppBackend, AppConfig, Arrangement, BasicTextField, Color, Column,
+    ColumnOptions, Composition, CompositionLocal, Constraints, CrossAxisAlignment, ElementKind,
+    FocusRequester, FocusState, KeyCode, KeyEvent, KeyModifiers, LazyColumn, LazyColumnOptions,
+    Modifier, MutableState, Offset, PointerEvent, PointerKind, PointerPhase, RecomposeRequest,
+    RenderCommand, Row, RowOptions, ScrollEvent, ScrollState, TaskHandle, TaskRuntime, Text,
+    TextFieldOptions, TextFieldState, TextInputEvent, TextOptions, TweenSpec, composable,
+    composition_local_of, disposable_effect, key, mutable_state_of, provide,
+    remember_mutable_state, side_effect,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
 
 #[composable]
-fn CounterApp(state_out: Rc<RefCell<Option<State<i32>>>>) {
-    let count = remember_state(|| 1);
+fn CounterApp(state_out: Rc<RefCell<Option<MutableState<i32>>>>) {
+    let count = remember_mutable_state(|| 1);
     *state_out.borrow_mut() = Some(count.clone());
-    Text(count.get().to_string());
+    Text(count.get().to_string(), TextOptions::default());
 }
 
 #[test]
-fn remember_state_survives_explicit_recompose() {
+fn remembered_mutable_state_survives_explicit_recompose() {
     let state_out = Rc::new(RefCell::new(None));
     let mut composition = {
         let state_out = state_out.clone();
-        Composition::new(move |__composer| {
-            mangled_composable!(CounterApp)(__composer, state_out.clone())
-        })
+        Composition::new(move || CounterApp(state_out.clone()))
     };
 
     let first = composition.compose();
@@ -48,7 +51,11 @@ fn remember_state_survives_explicit_recompose() {
 #[test]
 fn composable_macro_keeps_original_function_body() {
     let state_out = Rc::new(RefCell::new(None));
-    CounterApp(state_out.clone());
+    let mut composition = {
+        let state_out = state_out.clone();
+        Composition::new(move || CounterApp(state_out.clone()))
+    };
+    composition.compose();
 
     let state = state_out
         .borrow()
@@ -58,16 +65,64 @@ fn composable_macro_keeps_original_function_body() {
     assert_eq!(state.get(), 1);
 }
 
+#[test]
+fn a_panicking_composition_does_not_leak_its_composer_context() {
+    let mut panicking = Composition::new(|| panic!("intentional test panic"));
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| panicking.compose()));
+    assert!(panic.is_err());
+
+    let mut healthy = Composition::new(HealthyAfterPanic);
+    let result = healthy.compose();
+    assert_eq!(
+        text_value(only_text_command(&result.commands)),
+        "still usable"
+    );
+}
+
+#[test]
+fn a_panicking_provider_does_not_leak_its_composition_local() {
+    let local = composition_local_of(|| "default".to_string());
+    let should_panic = Rc::new(std::cell::Cell::new(true));
+    let mut composition = {
+        let local = local.clone();
+        let should_panic = should_panic.clone();
+        Composition::new(move || {
+            if should_panic.replace(false) {
+                provide(&local, "leaked".to_string(), || {
+                    panic!("intentional test panic")
+                });
+            } else {
+                LocalText(local.current());
+            }
+        })
+    };
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| composition.compose()));
+    assert!(panic.is_err());
+    let result = composition.compose();
+    assert_eq!(text_value(only_text_command(&result.commands)), "default");
+}
+
+#[composable]
+fn HealthyAfterPanic() {
+    Text("still usable", TextOptions::default());
+}
+
+#[composable]
+fn LocalText(value: String) {
+    Text(value, TextOptions::default());
+}
+
 #[composable]
 fn CountingCounterApp(
-    state_out: Rc<RefCell<Option<State<i32>>>>,
+    state_out: Rc<RefCell<Option<MutableState<i32>>>>,
     render_count: Rc<RefCell<usize>>,
 ) {
     *render_count.borrow_mut() += 1;
 
-    let count = remember_state(|| 1);
+    let count = remember_mutable_state(|| 1);
     *state_out.borrow_mut() = Some(count.clone());
-    Text(count.get().to_string());
+    Text(count.get().to_string(), TextOptions::default());
 }
 
 #[test]
@@ -78,13 +133,7 @@ fn state_updates_enqueue_recompose_requests_without_running_root() {
     let mut composition = {
         let state_out = state_out.clone();
         let render_count = render_count.clone();
-        Composition::new(move |__composer| {
-            mangled_composable!(CountingCounterApp)(
-                __composer,
-                state_out.clone(),
-                render_count.clone(),
-            )
-        })
+        Composition::new(move || CountingCounterApp(state_out.clone(), render_count.clone()))
     };
 
     composition.set_recompose_callback({
@@ -119,17 +168,81 @@ fn state_updates_enqueue_recompose_requests_without_running_root() {
 }
 
 #[composable]
-fn TodoItem(todo: String) {
-    Text(todo);
+fn StateReader(state: MutableState<i32>) {
+    Text(state.get().to_string(), TextOptions::default());
 }
 
 #[composable]
-fn TodoApp(state_out: Rc<RefCell<Option<State<Vec<String>>>>>) {
-    let todos = remember_state(|| vec!["alpha".to_string(), "beta".to_string()]);
+fn StateOwner(out: Rc<RefCell<Option<MutableState<i32>>>>) {
+    let state = remember_mutable_state(|| 0);
+    *out.borrow_mut() = Some(state.clone());
+    StateReader(state);
+}
+
+#[test]
+fn state_invalidation_targets_the_group_that_reads_it() {
+    let out = Rc::new(RefCell::new(None));
+    let mut composition = {
+        let out = out.clone();
+        Composition::new(move || StateOwner(out.clone()))
+    };
+    composition.compose();
+    let state = out.borrow().as_ref().unwrap().clone();
+    state.set(1);
+    let requests = composition.take_recompose_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].scope.0.len(), 2);
+}
+
+#[composable]
+fn ConditionalStateReader(
+    visible: MutableState<bool>,
+    child: Rc<RefCell<Option<MutableState<i32>>>>,
+) {
+    if visible.get() {
+        ConditionalStateChild(child);
+    }
+}
+
+#[composable]
+fn ConditionalStateChild(child: Rc<RefCell<Option<MutableState<i32>>>>) {
+    let value = remember_mutable_state(|| 0);
+    *child.borrow_mut() = Some(value.clone());
+    Text(value.get().to_string(), TextOptions::default());
+}
+
+#[test]
+fn state_updates_do_not_schedule_removed_recompose_scopes() {
+    let visible = mutable_state_of(true);
+    let child = Rc::new(RefCell::new(None));
+    let mut composition = {
+        let visible = visible.clone();
+        let child = child.clone();
+        Composition::new(move || ConditionalStateReader(visible.clone(), child.clone()))
+    };
+    composition.compose();
+    let state = child.borrow().as_ref().unwrap().clone();
+
+    visible.set(false);
+    composition.recompose();
+    composition.take_recompose_requests();
+    state.set(1);
+
+    assert!(composition.take_recompose_requests().is_empty());
+}
+
+#[composable]
+fn TodoItem(todo: String) {
+    Text(todo, TextOptions::default());
+}
+
+#[composable]
+fn TodoApp(state_out: Rc<RefCell<Option<MutableState<Vec<String>>>>>) {
+    let todos = remember_mutable_state(|| vec!["alpha".to_string(), "beta".to_string()]);
     *state_out.borrow_mut() = Some(todos.clone());
 
-    Column(|| {
-        for todo in todos.iter() {
+    Column(ColumnOptions::default(), || {
+        for todo in todos.get() {
             TodoItem(todo);
         }
     });
@@ -140,9 +253,7 @@ fn list_items_reuse_nodes_by_position() {
     let state_out = Rc::new(RefCell::new(None));
     let mut composition = {
         let state_out = state_out.clone();
-        Composition::new(move |__composer| {
-            mangled_composable!(TodoApp)(__composer, state_out.clone())
-        })
+        Composition::new(move || TodoApp(state_out.clone()))
     };
 
     let first = composition.compose();
@@ -168,22 +279,750 @@ fn list_items_reuse_nodes_by_position() {
 }
 
 #[composable]
-fn StyledLayout() {
-    Column_with_modifier(
-        Modifier::empty()
-            .padding(2.0)
-            .fill_max_width()
-            .background(Color::WHITE),
+fn KeyedItems(
+    items: Vec<(u64, String)>,
+    states: Rc<RefCell<std::collections::HashMap<u64, MutableState<String>>>>,
+) {
+    for (id, label) in items {
+        let states = states.clone();
+        key(id, || {
+            let value = remember_mutable_state(|| label);
+            states.borrow_mut().insert(id, value.clone());
+            Text(value.get(), TextOptions::default());
+        });
+    }
+}
+
+#[test]
+fn key_preserves_state_when_items_reorder() {
+    let items = Rc::new(RefCell::new(vec![
+        (1, "one".to_string()),
+        (2, "two".to_string()),
+    ]));
+    let states = Rc::new(RefCell::new(std::collections::HashMap::new()));
+    let mut composition = {
+        let items = items.clone();
+        let states = states.clone();
+        Composition::new(move || KeyedItems(items.borrow().clone(), states.clone()))
+    };
+    composition.compose();
+    states.borrow().get(&1).unwrap().set("changed".to_string());
+    *items.borrow_mut() = vec![(2, "two".to_string()), (1, "one".to_string())];
+
+    let result = composition.recompose();
+    assert_eq!(
+        text_values(&text_commands(&result.commands)),
+        vec!["two", "changed"]
+    );
+}
+
+#[composable]
+fn LocalReader(local: CompositionLocal<String>, values: Rc<RefCell<Vec<String>>>) {
+    values.borrow_mut().push(local.current());
+    provide(&local, "inner".to_string(), || {
+        values.borrow_mut().push(local.current())
+    });
+    values.borrow_mut().push(local.current());
+}
+
+#[test]
+fn composition_local_is_scoped_and_nested() {
+    let local = composition_local_of(|| "default".to_string());
+    let values = Rc::new(RefCell::new(Vec::new()));
+    let mut composition = {
+        let local = local.clone();
+        let values = values.clone();
+        Composition::new(move || {
+            provide(&local, "outer".to_string(), || {
+                LocalReader(local.clone(), values.clone())
+            })
+        })
+    };
+    composition.compose();
+    assert_eq!(&*values.borrow(), &["outer", "inner", "outer"]);
+}
+
+#[composable]
+fn EffectContent(show: bool, events: Rc<RefCell<Vec<&'static str>>>) {
+    side_effect({
+        let events = events.clone();
+        move || events.borrow_mut().push("side")
+    });
+    if show {
+        disposable_effect("visible", move || {
+            events.borrow_mut().push("start");
+            move || events.borrow_mut().push("dispose")
+        });
+    }
+}
+
+#[test]
+fn effects_follow_composition_lifecycle() {
+    let show = Rc::new(RefCell::new(true));
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let mut composition = {
+        let show = show.clone();
+        let events = events.clone();
+        Composition::new(move || EffectContent(*show.borrow(), events.clone()))
+    };
+    composition.compose();
+    *show.borrow_mut() = false;
+    composition.recompose();
+    assert_eq!(&*events.borrow(), &["start", "side", "dispose", "side"]);
+}
+
+struct TestTaskHandle;
+
+impl TaskHandle for TestTaskHandle {
+    fn cancel(&self) {}
+}
+
+struct CountingTaskRuntime(Rc<std::cell::Cell<usize>>);
+
+impl TaskRuntime for CountingTaskRuntime {
+    fn spawn(
+        &self,
+        _: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'static>>,
+    ) -> Rc<dyn TaskHandle> {
+        self.0.set(self.0.get() + 1);
+        Rc::new(TestTaskHandle)
+    }
+}
+
+#[composable]
+fn LaunchThenPanic() {
+    launched_effect("task", std::future::ready(()));
+    panic!("intentional test panic");
+}
+
+#[composable]
+fn LaunchTask() {
+    launched_effect("task", std::future::ready(()));
+}
+
+#[test]
+fn launched_effects_do_not_start_when_composition_panics() {
+    let spawns = Rc::new(std::cell::Cell::new(0));
+    let runtime = Rc::new(CountingTaskRuntime(spawns.clone()));
+    let mut composition = Composition::new(LaunchThenPanic).with_task_runtime(runtime);
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| composition.compose()));
+    assert!(panic.is_err());
+    assert_eq!(spawns.get(), 0);
+}
+
+#[test]
+fn launched_effects_start_once_after_successful_composition() {
+    let spawns = Rc::new(std::cell::Cell::new(0));
+    let runtime = Rc::new(CountingTaskRuntime(spawns.clone()));
+    let mut composition = Composition::new(LaunchTask).with_task_runtime(runtime);
+
+    composition.compose();
+    composition.recompose();
+    assert_eq!(spawns.get(), 1);
+}
+
+#[composable]
+fn DisposableThenPanic(events: Rc<RefCell<Vec<&'static str>>>) {
+    disposable_effect("resource", move || {
+        events.borrow_mut().push("setup");
+        || {}
+    });
+    panic!("intentional test panic");
+}
+
+#[test]
+fn disposable_effects_do_not_setup_when_composition_panics() {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let mut composition = {
+        let events = events.clone();
+        Composition::new(move || DisposableThenPanic(events.clone()))
+    };
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| composition.compose()));
+    assert!(panic.is_err());
+    assert!(events.borrow().is_empty());
+}
+
+#[test]
+fn foundation_state_objects_clamp_and_edit() {
+    let scroll = ScrollState::new(4.0);
+    scroll.set_max_value(10.0);
+    assert_eq!(scroll.scroll_by(20.0), 6.0);
+    assert_eq!(scroll.value(), 10.0);
+
+    let field = TextFieldState::new("a");
+    field.edit(|value| {
+        value.text.push('b');
+        value.selection = 2..2;
+    });
+    assert_eq!(field.text(), "ab");
+    assert_eq!(field.value().selection, 2..2);
+}
+
+#[test]
+fn text_field_normalizes_non_boundary_selections_before_editing() {
+    let state = TextFieldState::new("a你b");
+    state.set_value(karu::TextFieldValue {
+        text: "a你b".to_string(),
+        selection: 2..3,
+        composition: None,
+    });
+
+    state.replace_selection("x");
+    assert_eq!(state.text(), "ax你b");
+}
+
+#[test]
+fn text_field_handles_cursor_selection_shortcuts_and_history() {
+    let state = TextFieldState::new("one two");
+    state.set_cursor(state.text().len());
+
+    let word_select = state.handle_key(KeyEvent {
+        code: KeyCode::Left,
+        modifiers: KeyModifiers {
+            ctrl: true,
+            ..Default::default()
+        },
+        repeat: false,
+    });
+    assert!(word_select.handled);
+    assert_eq!(state.value().selection, 4..4);
+
+    state.handle_key(KeyEvent {
+        code: KeyCode::Right,
+        modifiers: KeyModifiers {
+            shift: true,
+            ..Default::default()
+        },
+        repeat: false,
+    });
+    assert_eq!(state.selected_text().as_deref(), Some("t"));
+
+    state.handle_key(KeyEvent {
+        code: KeyCode::A,
+        modifiers: KeyModifiers {
+            ctrl: true,
+            ..Default::default()
+        },
+        repeat: false,
+    });
+    let copied = state.handle_key(KeyEvent {
+        code: KeyCode::C,
+        modifiers: KeyModifiers {
+            ctrl: true,
+            ..Default::default()
+        },
+        repeat: false,
+    });
+    assert_eq!(copied.clipboard.as_deref(), Some("one two"));
+
+    state.handle_key(KeyEvent {
+        code: KeyCode::X,
+        modifiers: KeyModifiers {
+            ctrl: true,
+            ..Default::default()
+        },
+        repeat: false,
+    });
+    assert_eq!(state.text(), "");
+    state.handle_key(KeyEvent {
+        code: KeyCode::Z,
+        modifiers: KeyModifiers {
+            ctrl: true,
+            ..Default::default()
+        },
+        repeat: false,
+    });
+    assert_eq!(state.text(), "one two");
+    state.handle_key(KeyEvent {
+        code: KeyCode::Z,
+        modifiers: KeyModifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        },
+        repeat: false,
+    });
+    assert_eq!(state.text(), "");
+}
+
+#[test]
+fn text_field_composition_commits_and_can_be_undone() {
+    let state = TextFieldState::new("");
+    state.start_composition();
+    state.update_composition("ni");
+    assert_eq!(state.text(), "ni");
+    assert_eq!(state.value().composition, Some(0..2));
+
+    state.commit_composition("你");
+    assert_eq!(state.text(), "你");
+    assert_eq!(state.value().composition, None);
+    state.undo();
+    assert_eq!(state.text(), "");
+
+    state.start_composition();
+    state.update_composition("x");
+    state.end_composition();
+    assert_eq!(state.text(), "");
+}
+
+#[test]
+fn text_field_moves_and_deletes_by_grapheme_cluster() {
+    let state = TextFieldState::new("a😀e\u{301}");
+    state.set_cursor(state.text().len());
+    state.handle_key(KeyEvent {
+        code: KeyCode::Left,
+        modifiers: KeyModifiers::default(),
+        repeat: false,
+    });
+    assert_eq!(state.value().selection, 5..5);
+    state.backspace();
+    assert_eq!(state.text(), "ae\u{301}");
+    state.handle_key(KeyEvent {
+        code: KeyCode::Left,
+        modifiers: KeyModifiers::default(),
+        repeat: false,
+    });
+    assert_eq!(state.value().selection, 0..0);
+    state.handle_key(KeyEvent {
+        code: KeyCode::Right,
+        modifiers: KeyModifiers::default(),
+        repeat: false,
+    });
+    assert_eq!(state.value().selection, 1..1);
+}
+
+#[test]
+fn text_field_keeps_active_endpoint_for_reverse_selection() {
+    let state = TextFieldState::new("abcd");
+    state.select_range(1..4, Some(4));
+    assert_eq!(state.active_endpoint(), 1);
+    state.handle_key(KeyEvent {
+        code: KeyCode::Left,
+        modifiers: KeyModifiers {
+            shift: true,
+            ..Default::default()
+        },
+        repeat: false,
+    });
+    assert_eq!(state.value().selection, 0..4);
+    assert_eq!(state.active_endpoint(), 0);
+}
+
+#[composable]
+fn WeightedAndArrangedLayout() {
+    Column(
+        ColumnOptions::new()
+            .modifier(Modifier::empty().size(100.0, 100.0))
+            .vertical_arrangement(Arrangement::Center)
+            .horizontal_alignment(CrossAxisAlignment::Center),
         || {
-            Text_with_modifier("done", Modifier::empty().height(10.0));
+            Text("top", TextOptions::default());
+            Text("bottom", TextOptions::default());
+        },
+    );
+    Row(
+        RowOptions::new().modifier(Modifier::empty().size(100.0, 20.0)),
+        || {
+            Text(
+                "a",
+                TextOptions::new().modifier(Modifier::empty().weight(1.0)),
+            );
+            Text(
+                "b",
+                TextOptions::new().modifier(Modifier::empty().weight(1.0)),
+            );
+        },
+    );
+}
+
+#[test]
+fn row_weight_and_column_arrangement_allocate_parent_space() {
+    let result = Composition::new(WeightedAndArrangedLayout).compose();
+    let rects = text_commands(&result.commands)
+        .iter()
+        .map(|command| match command {
+            RenderCommand::DrawText { rect, .. } => *rect,
+            _ => unreachable!(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rects[0].origin.y, 30.0);
+    assert_eq!(rects[0].origin.x, 38.0);
+    assert_eq!(rects[1].origin.y, 50.0);
+    assert_eq!(rects[2].size.width, 50.0);
+    assert_eq!(rects[3].origin.x, 50.0);
+}
+
+#[composable]
+fn ScrollContent(state: ScrollState) {
+    Column(
+        ColumnOptions::new().modifier(Modifier::empty().size(80.0, 40.0).vertical_scroll(state)),
+        || {
+            Text("one", TextOptions::default());
+            Text("two", TextOptions::default());
+            Text("three", TextOptions::default());
+        },
+    );
+}
+
+#[test]
+fn scroll_modifier_measures_content_and_translates_children() {
+    let state = ScrollState::default();
+    let mut composition = {
+        let state = state.clone();
+        Composition::new(move || ScrollContent(state.clone()))
+    };
+    composition.compose();
+    assert_eq!(state.max_value(), 20.0);
+    assert!(composition.dispatch_scroll_event(ScrollEvent {
+        position: Offset::new(2.0, 2.0),
+        delta: Offset::new(0.0, 20.0),
+    }));
+    let result = composition.recompose();
+    let rects = text_commands(&result.commands)
+        .iter()
+        .map(|command| match command {
+            RenderCommand::DrawText { rect, .. } => *rect,
+            _ => unreachable!(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rects[0].origin.y, -20.0);
+    assert_eq!(rects[2].origin.y, 20.0);
+}
+
+#[composable]
+fn ScrollWithInteractiveChild(state: ScrollState) {
+    Column(
+        ColumnOptions::new().modifier(Modifier::empty().size(80.0, 40.0).vertical_scroll(state)),
+        || {
+            Text(
+                "tap",
+                TextOptions::new().modifier(Modifier::empty().clickable(|| {})),
+            );
+            Text("two", TextOptions::default());
+            Text("three", TextOptions::default());
+        },
+    );
+}
+
+#[test]
+fn scroll_event_bubbles_past_interactive_child() {
+    let state = ScrollState::default();
+    let mut composition = {
+        let state = state.clone();
+        Composition::new(move || ScrollWithInteractiveChild(state.clone()))
+    };
+    composition.compose();
+    assert!(composition.dispatch_scroll_event(ScrollEvent {
+        position: Offset::new(1.0, 1.0),
+        delta: Offset::new(0.0, 20.0),
+    }));
+    assert_eq!(state.value(), 20.0);
+}
+
+#[composable]
+fn SemanticContent() {
+    Text(
+        "settings",
+        TextOptions::new().modifier(
+            Modifier::empty()
+                .test_tag("settings-action")
+                .content_description("Open settings")
+                .role(karu::Role::Button),
+        ),
+    );
+}
+
+#[test]
+fn semantics_are_queryable_from_layout_tree() {
+    let result = Composition::new(SemanticContent).compose();
+    let tagged = result
+        .render_tree
+        .root
+        .find_by_test_tag("settings-action")
+        .expect("tagged node exists");
+    assert_eq!(tagged.semantics.role, Some(karu::Role::Button));
+    assert_eq!(
+        result
+            .render_tree
+            .root
+            .find_by_content_description("Open settings")
+            .map(|node| node.id),
+        Some(tagged.id)
+    );
+}
+
+#[composable]
+fn TextFieldContent(state: TextFieldState) {
+    BasicTextField(
+        &state,
+        TextFieldOptions::new().modifier(Modifier::empty().test_tag("editor")),
+    );
+}
+
+#[test]
+fn basic_text_field_exposes_editing_state_and_semantics() {
+    let state = TextFieldState::new("draft");
+    let mut composition = Composition::new({
+        let state = state.clone();
+        move || TextFieldContent(state.clone())
+    });
+    let result = composition.compose();
+    assert_eq!(text_value(only_text_command(&result.commands)), "draft");
+    let node = result.render_tree.root.find_by_test_tag("editor").unwrap();
+    assert_eq!(node.semantics.role, Some(karu::Role::TextField));
+    assert!(
+        composition.dispatch_text_input_event(TextInputEvent::Insert {
+            position: Offset::new(1.0, 1.0),
+            text: "!".to_string(),
+        })
+    );
+    assert_eq!(
+        text_value(only_text_command(&composition.recompose().commands)),
+        "draft!"
+    );
+    assert!(
+        composition.dispatch_text_input_event(TextInputEvent::Backspace {
+            position: Offset::new(1.0, 1.0),
+        })
+    );
+    assert_eq!(state.text(), "draft");
+}
+
+#[test]
+fn basic_text_field_draws_a_cursor_and_supports_mouse_drag_selection() {
+    let state = TextFieldState::new("abcd");
+    let mut composition = Composition::new({
+        let state = state.clone();
+        move || TextFieldContent(state.clone())
+    });
+    let first = composition.compose();
+    let node = first.render_tree.root.find_by_test_tag("editor").unwrap();
+    let origin = node.bounds.origin;
+
+    composition.dispatch_pointer_event(PointerEvent {
+        kind: PointerKind::Mouse,
+        phase: PointerPhase::Down,
+        position: Offset::new(origin.x, origin.y + 1.0),
+        primary: true,
+    });
+    let focused = composition.recompose();
+    assert!(
+        focused
+            .commands
+            .iter()
+            .any(|command| matches!(command, RenderCommand::DrawCursor { .. }))
+    );
+
+    composition.dispatch_pointer_event(PointerEvent {
+        kind: PointerKind::Mouse,
+        phase: PointerPhase::Move,
+        position: Offset::new(origin.x + 16.0, origin.y + 1.0),
+        primary: false,
+    });
+    composition.dispatch_pointer_event(PointerEvent {
+        kind: PointerKind::Mouse,
+        phase: PointerPhase::Up,
+        position: Offset::new(origin.x + 16.0, origin.y + 1.0),
+        primary: true,
+    });
+    assert_eq!(state.selected_text().as_deref(), Some("ab"));
+    let selected = composition.recompose();
+    assert!(
+        selected
+            .commands
+            .iter()
+            .any(|command| matches!(command, RenderCommand::DrawSelection { .. }))
+    );
+}
+
+#[composable]
+fn TwoTextFields(first: TextFieldState, second: TextFieldState) {
+    Column(ColumnOptions::default(), || {
+        BasicTextField(
+            &first,
+            TextFieldOptions::new().modifier(Modifier::empty().test_tag("first")),
+        );
+        BasicTextField(
+            &second,
+            TextFieldOptions::new().modifier(Modifier::empty().test_tag("second")),
+        );
+    });
+}
+
+#[test]
+fn text_input_prefers_the_active_field_over_pointer_position() {
+    let first = TextFieldState::new("one");
+    let second = TextFieldState::new("two");
+    let mut composition = {
+        let first = first.clone();
+        let second = second.clone();
+        Composition::new(move || TwoTextFields(first.clone(), second.clone()))
+    };
+    let result = composition.compose();
+    let first_node = result.render_tree.root.find_by_test_tag("first").unwrap();
+    let second_node = result.render_tree.root.find_by_test_tag("second").unwrap();
+
+    assert!(composition.dispatch_pointer_event(PointerEvent {
+        kind: PointerKind::Mouse,
+        phase: PointerPhase::Down,
+        position: Offset::new(
+            first_node.bounds.origin.x + 1.0,
+            first_node.bounds.origin.y + 1.0
+        ),
+        primary: true,
+    }));
+    assert!(
+        composition.dispatch_text_input_event(TextInputEvent::Insert {
+            position: Offset::new(
+                second_node.bounds.origin.x + 1.0,
+                second_node.bounds.origin.y + 1.0
+            ),
+            text: "!".to_string(),
+        })
+    );
+
+    assert_eq!(first.text(), "one!");
+    assert_eq!(second.text(), "two");
+}
+
+#[composable]
+fn FocusableContent(requester: FocusRequester, state: FocusState) {
+    Text(
+        "focus me",
+        TextOptions::new().modifier(Modifier::empty().focusable(requester, state)),
+    );
+}
+
+#[test]
+fn focusable_modifier_requests_focus_and_exposes_semantics() {
+    let requester = FocusRequester::new();
+    let state = FocusState::default();
+    let mut composition = {
+        let state = state.clone();
+        Composition::new(move || FocusableContent(requester, state.clone()))
+    };
+    composition.compose();
+    assert!(composition.dispatch_pointer_event(PointerEvent {
+        kind: PointerKind::Mouse,
+        phase: PointerPhase::Down,
+        position: Offset::new(1.0, 1.0),
+        primary: true,
+    }));
+    let result = composition.recompose();
+    assert!(state.is_focused(requester));
+    assert!(
+        result.render_tree.root.children[0].children[0]
+            .semantics
+            .focused
+    );
+}
+
+#[test]
+fn focus_requesters_have_distinct_runtime_identity() {
+    assert_ne!(FocusRequester::new(), FocusRequester::new());
+}
+
+#[composable]
+fn LazyItems(values: Vec<String>, state: ScrollState) {
+    LazyColumn(
+        LazyColumnOptions::new()
+            .state(state)
+            .modifier(Modifier::empty().size(80.0, 40.0)),
+        |list| {
+            list.items(
+                values,
+                |value| value.clone(),
+                |value| Text(value, TextOptions::default()),
+            );
+        },
+    );
+}
+
+#[test]
+fn lazy_column_keeps_keyed_items_and_scrolls() {
+    let items = Rc::new(RefCell::new(vec![
+        "one".to_string(),
+        "two".to_string(),
+        "three".to_string(),
+    ]));
+    let state = ScrollState::default();
+    let mut composition = {
+        let items = items.clone();
+        let state = state.clone();
+        Composition::new(move || LazyItems(items.borrow().clone(), state.clone()))
+    };
+    let first = composition.compose();
+    let ids = text_ids(&text_commands(&first.commands));
+    *items.borrow_mut() = vec!["three".to_string(), "one".to_string(), "two".to_string()];
+    let second = composition.recompose();
+    let second_ids = text_ids(&text_commands(&second.commands));
+    assert_eq!(second_ids[0], ids[2]);
+    assert_eq!(second_ids[1], ids[0]);
+    assert_eq!(state.max_value(), 20.0);
+}
+
+#[composable]
+fn DefaultLazyItems() {
+    LazyColumn(
+        LazyColumnOptions::new().modifier(Modifier::empty().size(80.0, 40.0).test_tag("list")),
+        |list| {
+            for value in ["one", "two", "three"] {
+                list.item(value, || Text(value, TextOptions::default()));
+            }
+        },
+    );
+}
+
+#[test]
+fn lazy_column_remembers_its_default_scroll_state() {
+    let mut composition = Composition::new(DefaultLazyItems);
+    let first = composition.compose();
+    let list = first.render_tree.root.find_by_test_tag("list").unwrap();
+    let first_origin = list.children[0].bounds.origin;
+
+    assert!(composition.dispatch_scroll_event(ScrollEvent {
+        position: Offset::new(1.0, 1.0),
+        delta: Offset::new(0.0, 10.0),
+    }));
+    let second = composition.recompose();
+    let list = second.render_tree.root.find_by_test_tag("list").unwrap();
+    assert_eq!(list.children[0].bounds.origin.y, first_origin.y - 10.0);
+}
+
+#[test]
+fn animatable_advances_with_host_frame_deltas() {
+    let animation = Animatable::new(0.0);
+    animation.animate_to(10.0, TweenSpec::new(100.0));
+    assert!(animation.advance_by(25.0));
+    assert_eq!(animation.value(), 2.5);
+    assert!(!animation.advance_by(75.0));
+    assert_eq!(animation.value(), 10.0);
+}
+
+#[composable]
+fn StyledLayout() {
+    Column(
+        ColumnOptions::new().modifier(
+            Modifier::empty()
+                .padding(2.0)
+                .fill_max_width()
+                .background(Color::WHITE),
+        ),
+        || {
+            Text(
+                "done",
+                TextOptions::new().modifier(Modifier::empty().height(10.0)),
+            );
         },
     );
 }
 
 #[test]
 fn modifiers_affect_layout_and_render_commands() {
-    let mut composition = Composition::new(mangled_composable!(StyledLayout))
-        .with_constraints(Constraints::loose(100.0, 100.0));
+    let mut composition =
+        Composition::new(StyledLayout).with_constraints(Constraints::loose(100.0, 100.0));
 
     let result = composition.compose();
     let column = &result.render_tree.root.children[0];
@@ -207,14 +1046,33 @@ fn modifiers_affect_layout_and_render_commands() {
     assert_eq!(text_value(text), "done");
 }
 
+#[composable]
+fn StyledText() {
+    Text(
+        "styled",
+        TextOptions::new()
+            .color(Color::rgb(0.2, 0.4, 0.6))
+            .font_size(18.0),
+    );
+}
+
+#[test]
+fn text_options_flow_into_render_commands() {
+    let result = Composition::new(StyledText).compose();
+    let command = only_text_command(&result.commands);
+    let RenderCommand::DrawText { style, .. } = command else {
+        unreachable!()
+    };
+    assert_eq!(style.color, Color::rgb(0.2, 0.4, 0.6));
+    assert_eq!(style.font_size, 18.0);
+}
+
 #[test]
 fn composition_tree_records_component_boundaries() {
     let state_out = Rc::new(RefCell::new(None));
     let mut composition = {
         let state_out = state_out.clone();
-        Composition::new(move |__composer| {
-            mangled_composable!(CounterApp)(__composer, state_out.clone())
-        })
+        Composition::new(move || CounterApp(state_out.clone()))
     };
 
     let result = composition.compose();
@@ -223,14 +1081,6 @@ fn composition_tree_records_component_boundaries() {
         result.root.children[0].kind,
         ElementKind::Component("CounterApp")
     ));
-}
-
-#[test]
-fn runtime_has_no_thread_local_current_composer_path() {
-    let composition_source = include_str!("../src/composition.rs");
-    assert!(!composition_source.contains("thread_local!"));
-    assert!(!composition_source.contains("CURRENT_COMPOSER"));
-    assert!(!composition_source.contains("run_in_current_scope"));
 }
 
 #[derive(Clone, Default)]
@@ -245,8 +1095,8 @@ struct MockAppState {
 }
 
 impl AppBackend for MockAppBackend {
-    fn run(self, mut root: AppRoot, config: AppConfig) {
-        let mut composition = Composition::new(move |composer: &mut Composer| root(composer));
+    fn run(self, root: karu::AppRoot, config: AppConfig) {
+        let mut composition = Composition::new(root);
         let result = composition.compose();
         let mut state = self.state.borrow_mut();
         state.config = Some(config);
@@ -256,7 +1106,7 @@ impl AppBackend for MockAppBackend {
 
 #[composable]
 fn AppRootComponent() {
-    Text("hello app");
+    Text("hello app", TextOptions::default());
 }
 
 #[test]
@@ -270,7 +1120,7 @@ fn app_builder_runs_composable_root_with_backend() {
         .title("Karu Test")
         .size(320, 240)
         .build()
-        .run(mangled_composable!(AppRootComponent));
+        .run(AppRootComponent);
 
     let state = state.borrow();
     let config = state.config.as_ref().expect("backend received app config");

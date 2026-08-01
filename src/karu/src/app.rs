@@ -1,7 +1,6 @@
-use crate::composition::Composer;
 use crate::modifier::Color;
 
-pub type AppRoot = Box<dyn FnMut(&mut Composer)>;
+pub type AppRoot = Box<dyn FnMut()>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AppConfig {
@@ -98,7 +97,7 @@ impl<B> AppBuilder<B> {
 }
 
 impl<B: AppBackend> App<B> {
-    pub fn run(self, root: impl FnMut(&mut Composer) + 'static) {
+    pub fn run(self, root: impl FnMut() + 'static) {
         self.backend.run(Box::new(root), self.config);
     }
 }
