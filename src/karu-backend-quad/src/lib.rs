@@ -5,17 +5,19 @@ use karu::{
     PointerEvent, PointerPhase, Recomposer, Rect, RenderBackend, RenderCommand, Size,
     TextEditCommand, TextInputCommand, TextInputEvent, TextInputResult, TextLayoutEngine, TextWrap,
 };
+use macroquad::conf::{Conf, UpdateTrigger};
 use macroquad::input::{
     KeyCode as QuadKeyCode, MouseButton, TouchPhase, get_char_pressed, is_key_down, is_key_pressed,
     is_mouse_button_pressed, is_mouse_button_released, mouse_position, mouse_wheel, touches,
 };
 use macroquad::prelude::{
-    Color as QuadColor, Conf, clear_background, draw_rectangle, draw_rectangle_lines, next_frame,
+    Color as QuadColor, clear_background, draw_rectangle, draw_rectangle_lines, next_frame,
     screen_height, screen_width,
 };
 use std::cell::RefCell;
 use std::ops::Range;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -24,6 +26,14 @@ pub struct Quad;
 impl Quad {
     pub fn new() -> Self {
         Self
+    }
+
+    pub fn on_demand(self) -> ConfiguredQuad {
+        ConfiguredQuad::default().on_demand()
+    }
+
+    pub fn continuous(self) -> ConfiguredQuad {
+        ConfiguredQuad::default().continuous()
     }
 
     #[cfg(feature = "font-kit")]
@@ -37,13 +47,34 @@ impl Quad {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum QuadFrameMode {
+    #[default]
+    OnDemand,
+    Continuous,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ConfiguredQuad {
+    frame_mode: QuadFrameMode,
     #[cfg(feature = "font-kit")]
     font: Option<FontConfig>,
 }
 
 impl ConfiguredQuad {
+    pub fn frame_mode(mut self, frame_mode: QuadFrameMode) -> Self {
+        self.frame_mode = frame_mode;
+        self
+    }
+
+    pub fn on_demand(self) -> Self {
+        self.frame_mode(QuadFrameMode::OnDemand)
+    }
+
+    pub fn continuous(self) -> Self {
+        self.frame_mode(QuadFrameMode::Continuous)
+    }
+
     fn font_family(&self) -> Option<String> {
         #[cfg(feature = "font-kit")]
         {
@@ -86,16 +117,35 @@ impl AppBackend for Quad {
 
 impl AppBackend for ConfiguredQuad {
     fn run(self, root: AppRoot, config: AppConfig) {
-        let window = Conf {
-            window_title: config.title.clone(),
-            window_width: config.width as i32,
-            window_height: config.height as i32,
-            window_resizable: config.resizable,
-            ..Default::default()
-        };
+        let window = window_config(&config, self.frame_mode);
 
         macroquad::Window::from_config(window, run_quad(root, config, self));
     }
+}
+
+fn window_config(config: &AppConfig, frame_mode: QuadFrameMode) -> Conf {
+    let mut window = Conf::default();
+    window.miniquad_conf.window_title = config.title.clone();
+    window.miniquad_conf.window_width = config.width as i32;
+    window.miniquad_conf.window_height = config.height as i32;
+    window.miniquad_conf.window_resizable = config.resizable;
+
+    if frame_mode == QuadFrameMode::OnDemand {
+        window.miniquad_conf.platform.blocking_event_loop = true;
+        window.update_on = Some(UpdateTrigger {
+            key_down: true,
+            mouse_down: true,
+            mouse_up: true,
+            mouse_motion: true,
+            mouse_wheel: true,
+            touch: true,
+            ..Default::default()
+        });
+    } else {
+        window.update_on = None;
+    }
+
+    window
 }
 
 async fn run_quad(root: AppRoot, config: AppConfig, quad: ConfiguredQuad) {
@@ -104,6 +154,7 @@ async fn run_quad(root: AppRoot, config: AppConfig, quad: ConfiguredQuad) {
     let mut backend = QuadBackend::new(family);
     let mut composition = Composition::new(root);
     let mut recomposer = Recomposer::new();
+    let mut stats = QuadFrameStats::new(std::env::var_os("KARU_QUAD_DEBUG").is_some());
     macroquad::input::simulate_mouse_with_touch(false);
     let mut previous_mouse_position = None;
 
@@ -237,17 +288,69 @@ async fn run_quad(root: AppRoot, config: AppConfig, quad: ConfiguredQuad) {
             );
         }
 
-        let result = recomposer
-            .recompose_with(&mut composition, &mut text_layout)
-            .or_else(|| composition.last_result().cloned())
-            .expect("composition result exists");
+        let recomposed =
+            if let Some(result) = recomposer.recompose_with(&mut composition, &mut text_layout) {
+                render_result(&mut backend, &result);
+                true
+            } else {
+                let result = composition
+                    .last_result()
+                    .expect("composition result exists after the first frame");
+                render_result(&mut backend, result);
+                false
+            };
 
-        backend
-            .render(&result.render_tree, &result.commands)
-            .expect("quad rendering succeeds");
-        update_ime(&result.commands);
+        stats.record(recomposed, composition.last_result());
 
         next_frame().await;
+    }
+}
+
+fn render_result(backend: &mut QuadBackend, result: &karu::CompositionResult) {
+    backend
+        .render(&result.render_tree, &result.commands)
+        .expect("quad rendering succeeds");
+    update_ime(&result.commands);
+}
+
+struct QuadFrameStats {
+    enabled: bool,
+    started: Instant,
+    frames: u64,
+    recompositions: u64,
+    commands: usize,
+}
+
+impl QuadFrameStats {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            started: Instant::now(),
+            frames: 0,
+            recompositions: 0,
+            commands: 0,
+        }
+    }
+
+    fn record(&mut self, recomposed: bool, result: Option<&karu::CompositionResult>) {
+        if !self.enabled {
+            return;
+        }
+
+        self.frames += 1;
+        self.recompositions += u64::from(recomposed);
+        self.commands = result.map_or(0, |result| result.commands.len());
+
+        let elapsed = self.started.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            eprintln!(
+                "[karu][quad] frames={} recompositions={} commands={} elapsed={:?}",
+                self.frames, self.recompositions, self.commands, elapsed,
+            );
+            self.started = Instant::now();
+            self.frames = 0;
+            self.recompositions = 0;
+        }
     }
 }
 
@@ -1014,6 +1117,39 @@ fn cosmic_text_content() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn on_demand_mode_uses_a_blocking_event_loop() {
+        let window = window_config(&karu::AppConfig::default(), QuadFrameMode::OnDemand);
+
+        assert!(window.miniquad_conf.platform.blocking_event_loop);
+        let update_on = window.update_on.expect("on-demand mode has input triggers");
+        assert!(update_on.key_down);
+        assert!(update_on.mouse_motion);
+        assert!(update_on.mouse_wheel);
+        assert!(update_on.touch);
+    }
+
+    #[test]
+    fn continuous_mode_keeps_the_event_loop_running() {
+        let window = window_config(&karu::AppConfig::default(), QuadFrameMode::Continuous);
+
+        assert!(!window.miniquad_conf.platform.blocking_event_loop);
+        assert!(window.update_on.is_none());
+    }
+
+    #[test]
+    fn quad_builders_select_the_requested_frame_mode() {
+        assert_eq!(
+            ConfiguredQuad::default().frame_mode,
+            QuadFrameMode::OnDemand
+        );
+        assert_eq!(
+            Quad::new().continuous().frame_mode,
+            QuadFrameMode::Continuous
+        );
+        assert_eq!(Quad::new().on_demand().frame_mode, QuadFrameMode::OnDemand);
+    }
 
     #[test]
     fn converts_karu_color_to_quad_color() {

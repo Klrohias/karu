@@ -5,7 +5,7 @@ use karu::{
     SpacerOptions, Text, TextFieldOptions, TextFieldValue, TextOptions, composable,
     remember_mutable_state, remember_scroll_state, remember_text_field_state,
 };
-use karu_backend_wgpu::Wgpu;
+use karu_backend_quad::Quad;
 use karu_basic::{Button, ButtonOptions, Surface, SurfaceOptions};
 
 const BACKGROUND: Color = Color::rgb(0.94, 0.95, 0.97);
@@ -591,7 +591,7 @@ fn TodoApp() {
 
 fn main() {
     App::builder()
-        .with_renderer(Wgpu.default_system_font().enable_debug_info())
+        .with_renderer(Quad.default_system_font())
         .title("Karu Todo")
         .size(1100, 720)
         .background(BACKGROUND)
