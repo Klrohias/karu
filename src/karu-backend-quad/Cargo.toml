@@ -3,13 +3,8 @@ name = "karu-backend-quad"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-default = []
-font-kit = ["dep:font-kit"]
-
 [dependencies]
 cosmic-text = "0.19"
-font-kit = { version = "0.14", optional = true }
 karu = { path = "../karu" }
 macroquad = "0.4"
 unicode-segmentation = "1.12"
