@@ -6,7 +6,7 @@ use crate::{
     KeyCode, KeyEvent, MutableState, Offset, Size, TextEditCommand, TextInputResult,
     mutable_state_of,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::ops::Range;
 use std::rc::Rc;
@@ -18,6 +18,7 @@ use unicode_segmentation::UnicodeSegmentation;
 pub struct ScrollState {
     offset: MutableState<f32>,
     max_value: MutableState<f32>,
+    recompose_on_scroll: Rc<Cell<bool>>,
 }
 
 impl ScrollState {
@@ -25,6 +26,7 @@ impl ScrollState {
         Self {
             offset: mutable_state_of(initial.max(0.0)),
             max_value: mutable_state_of(0.0),
+            recompose_on_scroll: Rc::new(Cell::new(false)),
         }
     }
 
@@ -49,6 +51,21 @@ impl ScrollState {
         let previous = self.value();
         self.scroll_to(previous + delta);
         self.value() - previous
+    }
+
+    pub(crate) fn scroll_by_without_invalidation(&self, delta: f32) -> f32 {
+        let previous = self.value();
+        let next = (previous + delta).clamp(0.0, self.max_value());
+        self.offset.set_without_invalidation(next);
+        next - previous
+    }
+
+    pub(crate) fn set_recompose_on_scroll(&self, enabled: bool) {
+        self.recompose_on_scroll.set(enabled);
+    }
+
+    pub(crate) fn recompose_on_scroll(&self) -> bool {
+        self.recompose_on_scroll.get()
     }
 }
 

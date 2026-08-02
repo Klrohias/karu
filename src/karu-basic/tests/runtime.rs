@@ -38,10 +38,10 @@ fn button_is_built_from_box_and_modifiers() {
 
     let button_id = button.id;
     assert!(result.commands.iter().any(|command| {
-        matches!(command, RenderCommand::PushClip(rect) if *rect == button.bounds)
+        matches!(command, RenderCommand::PushClip { rect, radius, .. } if *rect == button.bounds && *radius == 4.0)
     }));
     assert!(result.commands.iter().any(|command| {
-        matches!(command, RenderCommand::FillRect { node, .. } if *node == button_id)
+        matches!(command, RenderCommand::FillRect { node, radius, .. } if *node == button_id && *radius == 4.0)
     }));
     assert!(result.commands.iter().any(|command| {
         matches!(command, RenderCommand::StrokeRect { node, .. } if *node == button_id)

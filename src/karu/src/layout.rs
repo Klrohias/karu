@@ -3,7 +3,7 @@ use crate::element::{Element, ElementKind, NodeId};
 use crate::event::{EventRegistry, InteractionState};
 use crate::modifier::{
     Alignment, Arrangement, BorderData, Brush, Color, CrossAxisAlignment, ModifierData, ScrollAxis,
-    Semantics,
+    ScrollData, Semantics,
 };
 use crate::renderer::TextLayoutEngine;
 use crate::text_layout::TextWrap;
@@ -141,6 +141,8 @@ pub struct LayoutNode {
     pub text_viewport: Rect,
     pub text_wrap: TextWrap,
     pub text_scroll: Offset,
+    pub scroll: Option<ScrollData>,
+    pub scroll_offset: f32,
     pub children: Vec<LayoutNode>,
 }
 
@@ -339,7 +341,8 @@ fn layout_element(
         _ => {}
     }
 
-    if let Some(scroll) = &data.scroll {
+    let scroll_data = data.scroll.clone();
+    let scroll_offset = if let Some(scroll) = &scroll_data {
         let viewport = match scroll.axis {
             ScrollAxis::Horizontal => (size.width - data.padding.horizontal()).max(0.0),
             ScrollAxis::Vertical => (size.height - data.padding.vertical()).max(0.0),
@@ -356,7 +359,10 @@ fn layout_element(
                 ScrollAxis::Vertical => translate_node(child, 0.0, -offset),
             }
         }
-    }
+        offset
+    } else {
+        0.0
+    };
 
     if matches!(element.kind, ElementKind::Box) {
         for child in &mut children {
@@ -402,6 +408,8 @@ fn layout_element(
         text_viewport,
         text_wrap: data.text_wrap,
         text_scroll,
+        scroll: scroll_data,
+        scroll_offset,
         children,
     }
 }
@@ -568,7 +576,7 @@ fn place_arranged_children(
     }
 }
 
-fn translate_node(node: &mut LayoutNode, dx: f32, dy: f32) {
+pub(crate) fn translate_node(node: &mut LayoutNode, dx: f32, dy: f32) {
     node.bounds.origin.x += dx;
     node.bounds.origin.y += dy;
     node.text_origin.x += dx;

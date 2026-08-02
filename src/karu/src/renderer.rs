@@ -2,6 +2,7 @@ use crate::element::{ElementKind, NodeId};
 use crate::layout::{LayoutNode, Offset, Rect};
 use crate::modifier::{Brush, Color};
 use crate::{CaretAffinity, CaretPosition, Clipboard, NoopClipboard, Size, TextWrap};
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
@@ -60,17 +61,23 @@ impl Default for TextStyle {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RenderCommand {
-    PushClip(Rect),
+    PushClip {
+        node: NodeId,
+        rect: Rect,
+        radius: f32,
+    },
     PopClip,
     FillRect {
         node: NodeId,
         rect: Rect,
         color: Color,
+        radius: f32,
     },
     FillBrush {
         node: NodeId,
         rect: Rect,
         brush: Brush,
+        radius: f32,
     },
     StrokeRect {
         node: NodeId,
@@ -277,13 +284,63 @@ pub fn commands_for_tree_with_layout(
     commands
 }
 
+pub(crate) fn translate_commands(
+    commands: &mut [RenderCommand],
+    nodes: &HashSet<NodeId>,
+    dx: f32,
+    dy: f32,
+) {
+    for command in commands {
+        let node = match command {
+            RenderCommand::PushClip { node, .. }
+            | RenderCommand::FillRect { node, .. }
+            | RenderCommand::FillBrush { node, .. }
+            | RenderCommand::StrokeRect { node, .. }
+            | RenderCommand::DrawText { node, .. }
+            | RenderCommand::DrawSelection { node, .. }
+            | RenderCommand::DrawCursor { node, .. }
+            | RenderCommand::DrawComposition { node, .. }
+            | RenderCommand::DrawImage { node, .. } => *node,
+            RenderCommand::PopClip => continue,
+        };
+        if !nodes.contains(&node) {
+            continue;
+        }
+
+        match command {
+            RenderCommand::PushClip { rect, .. }
+            | RenderCommand::FillRect { rect, .. }
+            | RenderCommand::FillBrush { rect, .. }
+            | RenderCommand::StrokeRect { rect, .. }
+            | RenderCommand::DrawSelection { rect, .. }
+            | RenderCommand::DrawCursor { rect, .. }
+            | RenderCommand::DrawComposition { rect, .. }
+            | RenderCommand::DrawImage { rect, .. } => {
+                rect.origin.x += dx;
+                rect.origin.y += dy;
+            }
+            RenderCommand::DrawText { rect, offset, .. } => {
+                rect.origin.x += dx;
+                rect.origin.y += dy;
+                offset.x += dx;
+                offset.y += dy;
+            }
+            RenderCommand::PopClip => unreachable!(),
+        }
+    }
+}
+
 fn push_commands(
     node: &LayoutNode,
     commands: &mut Vec<RenderCommand>,
     layout: &mut dyn TextLayoutEngine,
 ) {
     if node.clip {
-        commands.push(RenderCommand::PushClip(node.bounds));
+        commands.push(RenderCommand::PushClip {
+            node: node.id,
+            rect: node.bounds,
+            radius: node.border_radius,
+        });
     }
 
     if let Some(brush) = &node.background_brush {
@@ -292,11 +349,13 @@ fn push_commands(
                 node: node.id,
                 rect: node.bounds,
                 color: *color,
+                radius: node.border_radius,
             }),
             _ => commands.push(RenderCommand::FillBrush {
                 node: node.id,
                 rect: node.bounds,
                 brush: brush.clone(),
+                radius: node.border_radius,
             }),
         }
     } else if let Some(color) = node.background {
@@ -304,6 +363,7 @@ fn push_commands(
             node: node.id,
             rect: node.bounds,
             color,
+            radius: node.border_radius,
         });
     }
 

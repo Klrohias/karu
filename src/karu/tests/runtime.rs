@@ -57,6 +57,56 @@ fn text_layout_hits_measured_grapheme_intervals() {
     );
 }
 
+#[test]
+fn repeated_pointer_moves_do_not_invalidate_without_interaction_changes() {
+    let moves = Rc::new(std::cell::Cell::new(0));
+    let mut composition = {
+        let moves = moves.clone();
+        Composition::new(move || {
+            let moves = moves.clone();
+            Text(
+                "target",
+                TextOptions::new().modifier(
+                    Modifier::empty()
+                        .size(100.0, 40.0)
+                        .on_pointer_event(move |_| moves.set(moves.get() + 1)),
+                ),
+            );
+        })
+    };
+
+    let result = composition.compose();
+    let target = result.render_tree.root.children[0].clone();
+    let inside = Offset::new(target.bounds.origin.x + 1.0, target.bounds.origin.y + 1.0);
+    let outside = Offset::new(target.bounds.origin.x + 101.0, target.bounds.origin.y + 1.0);
+
+    assert!(composition.dispatch_pointer_event(PointerEvent {
+        kind: PointerKind::Mouse,
+        phase: PointerPhase::Move,
+        position: inside,
+        primary: false,
+    }));
+    assert!(composition.is_dirty());
+    composition.recompose();
+
+    assert!(composition.dispatch_pointer_event(PointerEvent {
+        kind: PointerKind::Mouse,
+        phase: PointerPhase::Move,
+        position: inside,
+        primary: false,
+    }));
+    assert!(!composition.is_dirty());
+    assert_eq!(moves.get(), 2);
+
+    assert!(!composition.dispatch_pointer_event(PointerEvent {
+        kind: PointerKind::Mouse,
+        phase: PointerPhase::Move,
+        position: outside,
+        primary: false,
+    }));
+    assert!(composition.is_dirty());
+}
+
 struct CountingTextLayout {
     calls: Rc<std::cell::Cell<usize>>,
     layout: HeadlessTextLayout,
@@ -921,6 +971,41 @@ fn scroll_modifier_measures_content_and_translates_children() {
     assert_eq!(rects[2].origin.y, 20.0);
 }
 
+#[test]
+fn scroll_updates_geometry_without_dirtying_or_measuring_again() {
+    let state = ScrollState::default();
+    let calls = Rc::new(std::cell::Cell::new(0));
+    let mut composition = {
+        let state = state.clone();
+        Composition::new(move || ScrollContent(state.clone()))
+    };
+    let mut layout = CountingTextLayout {
+        calls: calls.clone(),
+        layout: HeadlessTextLayout,
+    };
+
+    composition.compose_with(&mut layout);
+    let measured = calls.get();
+    assert!(measured > 0);
+    assert!(composition.dispatch_scroll_event(ScrollEvent {
+        position: Offset::new(2.0, 2.0),
+        delta: Offset::new(0.0, 20.0),
+    }));
+
+    assert!(!composition.is_dirty());
+    assert_eq!(calls.get(), measured);
+    let result = composition.last_result().expect("scroll result exists");
+    let rects = text_commands(&result.commands)
+        .iter()
+        .map(|command| match command {
+            RenderCommand::DrawText { rect, .. } => *rect,
+            _ => unreachable!(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rects[0].origin.y, -20.0);
+    assert_eq!(rects[2].origin.y, 20.0);
+}
+
 #[composable]
 fn ScrollWithInteractiveChild(state: ScrollState) {
     Column(
@@ -1253,6 +1338,56 @@ fn lazy_column_remembers_its_default_scroll_state() {
     let second = composition.recompose();
     let list = second.render_tree.root.find_by_test_tag("list").unwrap();
     assert_eq!(list.children[0].bounds.origin.y, first_origin.y - 10.0);
+}
+
+#[composable]
+fn VirtualLazyItems(state: ScrollState) {
+    LazyColumn(
+        LazyColumnOptions::new()
+            .state(state)
+            .item_extent(20.0)
+            .overscan(0)
+            .modifier(Modifier::empty().size(80.0, 40.0)),
+        |list| {
+            list.items(
+                0..10,
+                |value| *value,
+                |value| {
+                    Text(format!("item-{value}"), TextOptions::default());
+                },
+            );
+        },
+    );
+}
+
+#[test]
+fn lazy_column_only_composes_visible_items_when_virtualized() {
+    let state = ScrollState::default();
+    let mut composition = {
+        let state = state.clone();
+        Composition::new(move || VirtualLazyItems(state.clone()))
+    };
+
+    let first = composition.compose();
+    assert_eq!(state.max_value(), 160.0);
+    assert_eq!(text_commands(&first.commands).len(), 2);
+    assert_eq!(
+        text_values(&text_commands(&first.commands)),
+        vec!["item-0", "item-1"]
+    );
+
+    assert!(composition.dispatch_scroll_event(ScrollEvent {
+        position: Offset::new(2.0, 2.0),
+        delta: Offset::new(0.0, 60.0),
+    }));
+    assert!(composition.is_dirty());
+
+    let second = composition.recompose();
+    assert_eq!(text_commands(&second.commands).len(), 2);
+    assert_eq!(
+        text_values(&text_commands(&second.commands)),
+        vec!["item-3", "item-4"]
+    );
 }
 
 #[test]

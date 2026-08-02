@@ -145,6 +145,9 @@ impl TextFieldOptions {
 pub struct LazyColumnOptions {
     pub modifier: Modifier,
     state: Option<ScrollState>,
+    item_extent: Option<f32>,
+    viewport_height: Option<f32>,
+    overscan: usize,
 }
 
 impl Default for LazyColumnOptions {
@@ -158,6 +161,9 @@ impl LazyColumnOptions {
         Self {
             modifier: Modifier::empty(),
             state: None,
+            item_extent: None,
+            viewport_height: None,
+            overscan: 2,
         }
     }
 
@@ -168,6 +174,29 @@ impl LazyColumnOptions {
 
     pub fn state(mut self, state: ScrollState) -> Self {
         self.state = Some(state);
+        self
+    }
+
+    pub fn item_extent(mut self, extent: f32) -> Self {
+        assert!(
+            extent.is_finite() && extent > 0.0,
+            "item extent must be positive"
+        );
+        self.item_extent = Some(extent);
+        self
+    }
+
+    pub fn viewport_height(mut self, height: f32) -> Self {
+        assert!(
+            height.is_finite() && height > 0.0,
+            "viewport height must be positive"
+        );
+        self.viewport_height = Some(height);
+        self
+    }
+
+    pub fn overscan(mut self, count: usize) -> Self {
+        self.overscan = count;
         self
     }
 }
@@ -226,7 +255,12 @@ pub fn BasicTextField(state: &TextFieldState, options: TextFieldOptions) {
     __karu_BasicTextField(state, options);
 }
 
-pub struct LazyColumnScope;
+pub struct LazyColumnScope {
+    state: ScrollState,
+    item_extent: Option<f32>,
+    viewport_height: Option<f32>,
+    overscan: usize,
+}
 
 impl LazyColumnScope {
     pub fn item<K: Hash>(&mut self, key: K, content: impl FnOnce()) {
@@ -239,9 +273,42 @@ impl LazyColumnScope {
         key: impl Fn(&T) -> K,
         mut content: impl FnMut(T),
     ) {
-        for item in items {
-            crate::key(key(&item), || content(item));
+        let items = items.into_iter().collect::<Vec<_>>();
+        let Some(extent) = self.item_extent else {
+            for item in items {
+                crate::key(key(&item), || content(item));
+            }
+            return;
+        };
+        let Some(viewport_height) = self.viewport_height else {
+            for item in items {
+                crate::key(key(&item), || content(item));
+            }
+            return;
+        };
+
+        let total = items.len();
+        let offset = self.state.value();
+        let start = ((offset / extent).floor() as usize).saturating_sub(self.overscan);
+        let end =
+            (((offset + viewport_height) / extent).ceil() as usize + self.overscan).min(total);
+        Spacer(SpacerOptions::new().modifier(Modifier::empty().height(start as f32 * extent)));
+        for (index, item) in items.into_iter().enumerate() {
+            if index < start || index >= end {
+                continue;
+            }
+            let item_key = key(&item);
+            crate::key(item_key, || {
+                __karu_Box(
+                    BoxOptions::new().modifier(Modifier::empty().height(extent)),
+                    || content(item),
+                );
+            });
         }
+        Spacer(
+            SpacerOptions::new()
+                .modifier(Modifier::empty().height(total.saturating_sub(end) as f32 * extent)),
+        );
     }
 }
 
@@ -313,10 +380,21 @@ pub fn __karu_LazyColumn(options: LazyColumnOptions, content: impl FnOnce(&mut L
     let state = options
         .state
         .unwrap_or_else(|| crate::remember_scroll_state(0.0));
+    let viewport_height = options
+        .viewport_height
+        .or_else(|| options.modifier.data().height);
+    let virtualized = options.item_extent.is_some() && viewport_height.is_some();
+    state.set_recompose_on_scroll(virtualized);
+    let scope_state = state.clone();
     __karu_Column(
         ColumnOptions::new().modifier(options.modifier.vertical_scroll(state)),
         || {
-            let mut scope = LazyColumnScope;
+            let mut scope = LazyColumnScope {
+                state: scope_state,
+                item_extent: options.item_extent,
+                viewport_height,
+                overscan: options.overscan,
+            };
             content(&mut scope);
         },
     );

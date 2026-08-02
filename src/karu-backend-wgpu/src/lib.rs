@@ -10,6 +10,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::num::NonZeroU64;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -186,15 +187,16 @@ impl WgpuApp {
         }
     }
 
-    fn dispatch_scroll(&mut self, delta: Offset) {
+    fn dispatch_scroll(&mut self, delta: Offset) -> bool {
         if let Some(runtime) = self.runtime.as_mut() {
-            runtime
+            return runtime
                 .composition
                 .dispatch_scroll_event(karu::ScrollEvent {
                     position: self.cursor,
                     delta,
                 });
         }
+        false
     }
 
     fn dispatch_text(&mut self, event: TextInputEvent) -> bool {
@@ -337,8 +339,9 @@ impl ApplicationHandler for WgpuApp {
                         Offset::new(position.x as f32, -position.y as f32)
                     }
                 };
-                self.dispatch_scroll(delta);
-                self.request_redraw_if_needed();
+                if self.dispatch_scroll(delta) {
+                    self.request_redraw();
+                }
             }
             WindowEvent::Touch(touch) => {
                 self.cursor = logical_position(touch.location, self.window.as_ref());
@@ -495,6 +498,71 @@ fn update_ime(window: &Window, commands: &[RenderCommand]) {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ScreenUniform {
     size: [f32; 2],
+    clip_count: u32,
+    _padding: u32,
+    clip_rects: [[f32; 4]; MAX_CLIPS],
+    clip_radii: [[f32; 4]; 2],
+}
+
+const MAX_CLIPS: usize = 8;
+
+#[derive(Clone, Copy)]
+struct ClipRect {
+    rect: Rect,
+    radius: f32,
+}
+
+fn screen_uniform(size: [f32; 2], clips: &[ClipRect]) -> ScreenUniform {
+    let mut clip_rects = [[0.0; 4]; MAX_CLIPS];
+    let mut clip_radii = [[0.0; 4]; 2];
+    for (index, clip) in clips.iter().take(MAX_CLIPS).enumerate() {
+        clip_rects[index] = [
+            clip.rect.origin.x,
+            clip.rect.origin.y,
+            clip.rect.size.width.max(0.0),
+            clip.rect.size.height.max(0.0),
+        ];
+        clip_radii[index / 4][index % 4] = clip.radius.max(0.0);
+    }
+    ScreenUniform {
+        size,
+        clip_count: clips.len().min(MAX_CLIPS) as u32,
+        _padding: 0,
+        clip_rects,
+        clip_radii,
+    }
+}
+
+fn clip_uniforms_for_commands(
+    commands: &[RenderCommand],
+    logical_size: [f32; 2],
+) -> Vec<ScreenUniform> {
+    let mut clips = Vec::new();
+    let mut uniforms = Vec::with_capacity(commands.len().max(1));
+    for command in commands {
+        uniforms.push(screen_uniform(logical_size, &clips));
+        match command {
+            RenderCommand::PushClip { rect, radius, .. } => {
+                let rect = clips
+                    .last()
+                    .copied()
+                    .map(|parent: ClipRect| intersect_rect(parent.rect, *rect))
+                    .unwrap_or(*rect);
+                clips.push(ClipRect {
+                    rect,
+                    radius: *radius,
+                });
+            }
+            RenderCommand::PopClip => {
+                clips.pop();
+            }
+            _ => {}
+        }
+    }
+    if uniforms.is_empty() {
+        uniforms.push(screen_uniform(logical_size, &clips));
+    }
+    uniforms
 }
 
 #[repr(C)]
@@ -547,7 +615,8 @@ pub struct WgpuBackend {
     shape_pipeline: wgpu::RenderPipeline,
     text_pipeline: wgpu::RenderPipeline,
     screen_buffer: wgpu::Buffer,
-    screen_bind_group: wgpu::BindGroup,
+    screen_bind_group_layout: wgpu::BindGroupLayout,
+    screen_uniform_stride: u64,
     text_bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     text_context: Rc<RefCell<FontSystem>>,
@@ -732,34 +801,32 @@ impl WgpuBackend {
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
         let scale_factor = window.scale_factor() as f32;
+        let screen_uniform_stride = aligned_uniform_stride(
+            std::mem::size_of::<ScreenUniform>() as u64,
+            device.limits().min_uniform_buffer_offset_alignment as u64,
+        );
         let screen_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("karu-wgpu-screen"),
-            contents: bytemuck::bytes_of(&ScreenUniform {
-                size: logical_surface_size(size, scale_factor),
-            }),
+            contents: bytemuck::bytes_of(&screen_uniform(
+                logical_surface_size(size, scale_factor),
+                &[],
+            )),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        let screen_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("karu-wgpu-screen-layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-        let screen_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("karu-wgpu-screen-bind-group"),
-            layout: &screen_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: screen_buffer.as_entire_binding(),
-            }],
-        });
+        let screen_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("karu-wgpu-screen-layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
         let text_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("karu-wgpu-text-layout"),
@@ -784,12 +851,15 @@ impl WgpuBackend {
             });
         let shape_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("karu-wgpu-shape-pipeline-layout"),
-            bind_group_layouts: &[Some(&screen_layout)],
+            bind_group_layouts: &[Some(&screen_bind_group_layout)],
             immediate_size: 0,
         });
         let text_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("karu-wgpu-text-pipeline-layout"),
-            bind_group_layouts: &[Some(&screen_layout), Some(&text_bind_group_layout)],
+            bind_group_layouts: &[
+                Some(&screen_bind_group_layout),
+                Some(&text_bind_group_layout),
+            ],
             immediate_size: 0,
         });
         let blend = Some(wgpu::BlendState::ALPHA_BLENDING);
@@ -861,7 +931,8 @@ impl WgpuBackend {
             shape_pipeline,
             text_pipeline,
             screen_buffer,
-            screen_bind_group,
+            screen_bind_group_layout,
+            screen_uniform_stride,
             text_bind_group_layout,
             sampler,
             text_context,
@@ -896,9 +967,10 @@ impl WgpuBackend {
         self.queue.write_buffer(
             &self.screen_buffer,
             0,
-            bytemuck::bytes_of(&ScreenUniform {
-                size: logical_surface_size(size, self.scale_factor),
-            }),
+            bytemuck::bytes_of(&screen_uniform(
+                logical_surface_size(size, self.scale_factor),
+                &[],
+            )),
         );
         if surface_changed {
             self.surface.configure(&self.device, &self.config);
@@ -930,6 +1002,36 @@ impl WgpuBackend {
         let surface_width = self.config.width;
         let surface_height = self.config.height;
         let device = &self.device;
+        let queue = &self.queue;
+        let logical_size =
+            logical_surface_size(PhysicalSize::new(surface_width, surface_height), scale);
+        let clip_uniforms = clip_uniforms_for_commands(commands, logical_size);
+        let uniform_count = clip_uniforms.len().max(1) as u64;
+        let frame_screen_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("karu-wgpu-frame-screen"),
+            size: self.screen_uniform_stride * uniform_count,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        for (index, uniform) in clip_uniforms.iter().enumerate() {
+            queue.write_buffer(
+                &frame_screen_buffer,
+                index as u64 * self.screen_uniform_stride,
+                bytemuck::bytes_of(uniform),
+            );
+        }
+        let frame_screen_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("karu-wgpu-frame-screen-bind-group"),
+            layout: &self.screen_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &frame_screen_buffer,
+                    offset: 0,
+                    size: NonZeroU64::new(std::mem::size_of::<ScreenUniform>() as u64),
+                }),
+            }],
+        });
         let shape_buffers = self.shape_cache.prepare(commands, device);
         let debug_info_buffer = self.debug_info.then(|| {
             let vertices = rect_vertices(
@@ -942,9 +1044,8 @@ impl WgpuBackend {
                 usage: wgpu::BufferUsages::VERTEX,
             })
         });
-        let queue = &self.queue;
         let shape_pipeline = &self.shape_pipeline;
-        let screen_bind_group = &self.screen_bind_group;
+        let screen_bind_group = &frame_screen_bind_group;
         let text_pipeline = &self.text_pipeline;
         let text_bind_group_layout = &self.text_bind_group_layout;
         let sampler = &self.sampler;
@@ -966,8 +1067,9 @@ impl WgpuBackend {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        let mut clips = Vec::new();
+        let mut clips = Vec::<ClipRect>::new();
         for (command_index, command) in commands.iter().enumerate() {
+            let screen_offset = (command_index as u64 * self.screen_uniform_stride) as u32;
             match command {
                 RenderCommand::FillRect { .. }
                 | RenderCommand::FillBrush { .. }
@@ -982,6 +1084,7 @@ impl WgpuBackend {
                             vertex_count,
                             shape_pipeline,
                             screen_bind_group,
+                            screen_offset,
                         );
                     }
                 }
@@ -999,6 +1102,7 @@ impl WgpuBackend {
                         queue,
                         text_pipeline,
                         screen_bind_group,
+                        screen_offset,
                         text_bind_group_layout,
                         sampler,
                         text_rasterizer,
@@ -1011,13 +1115,16 @@ impl WgpuBackend {
                         scale,
                     );
                 }
-                RenderCommand::PushClip(rect) => {
+                RenderCommand::PushClip { rect, radius, .. } => {
                     let logical = clips
                         .last()
                         .copied()
-                        .map(|parent| intersect_rect(parent, *rect))
+                        .map(|parent| intersect_rect(parent.rect, *rect))
                         .unwrap_or(*rect);
-                    clips.push(logical);
+                    clips.push(ClipRect {
+                        rect: logical,
+                        radius: *radius,
+                    });
                     let (x, y, width, height) =
                         scissor_rect(logical, scale, surface_width, surface_height);
                     pass.set_scissor_rect(x, y, width, height);
@@ -1026,7 +1133,7 @@ impl WgpuBackend {
                     clips.pop();
                     if let Some(rect) = clips.last() {
                         let (x, y, width, height) =
-                            scissor_rect(*rect, scale, surface_width, surface_height);
+                            scissor_rect(rect.rect, scale, surface_width, surface_height);
                         pass.set_scissor_rect(x, y, width, height);
                     } else {
                         pass.set_scissor_rect(0, 0, surface_width, surface_height);
@@ -1044,6 +1151,7 @@ impl WgpuBackend {
                 shape_pipeline,
                 text_pipeline,
                 screen_bind_group,
+                0,
                 text_bind_group_layout,
                 sampler,
                 text_cache,
@@ -1069,6 +1177,7 @@ impl TextResourceCache {
         queue: &wgpu::Queue,
         text_pipeline: &wgpu::RenderPipeline,
         screen_bind_group: &wgpu::BindGroup,
+        screen_offset: u32,
         text_bind_group_layout: &wgpu::BindGroupLayout,
         sampler: &wgpu::Sampler,
         text_rasterizer: &mut TextRasterizer,
@@ -1212,7 +1321,7 @@ impl TextResourceCache {
             return;
         };
         pass.set_pipeline(text_pipeline);
-        pass.set_bind_group(0, screen_bind_group, &[]);
+        pass.set_bind_group(0, screen_bind_group, &[screen_offset]);
         pass.set_bind_group(1, &resource.bind_group, &[]);
         pass.set_vertex_buffer(0, resource.vertex_buffer.slice(..));
         pass.draw(0..6, 0..1);
@@ -1256,9 +1365,10 @@ fn draw_shape<'a>(
     vertex_count: u32,
     shape_pipeline: &wgpu::RenderPipeline,
     screen_bind_group: &wgpu::BindGroup,
+    screen_offset: u32,
 ) {
     pass.set_pipeline(shape_pipeline);
-    pass.set_bind_group(0, screen_bind_group, &[]);
+    pass.set_bind_group(0, screen_bind_group, &[screen_offset]);
     pass.set_vertex_buffer(0, shape_buffer.slice(..));
     pass.draw(0..vertex_count, 0..1);
 }
@@ -1270,6 +1380,7 @@ fn draw_debug_info<'a>(
     shape_pipeline: &wgpu::RenderPipeline,
     text_pipeline: &wgpu::RenderPipeline,
     screen_bind_group: &wgpu::BindGroup,
+    screen_offset: u32,
     text_bind_group_layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
     text_cache: &mut TextResourceCache,
@@ -1285,6 +1396,7 @@ fn draw_debug_info<'a>(
         6,
         shape_pipeline,
         screen_bind_group,
+        screen_offset,
     );
 
     let label = format!("FPS {:.0}", fps);
@@ -1294,6 +1406,7 @@ fn draw_debug_info<'a>(
         queue,
         text_pipeline,
         screen_bind_group,
+        screen_offset,
         text_bind_group_layout,
         sampler,
         text_rasterizer,
@@ -1309,8 +1422,18 @@ fn draw_debug_info<'a>(
 
 fn shape_vertices(command: &RenderCommand) -> Option<Vec<ShapeVertex>> {
     let vertices = match command {
-        RenderCommand::FillRect { rect, color, .. } => rect_vertices(*rect, *color),
-        RenderCommand::FillBrush { rect, brush, .. } => brush_vertices(*rect, brush),
+        RenderCommand::FillRect {
+            rect,
+            color,
+            radius,
+            ..
+        } => rounded_rect_vertices(*rect, &Brush::Solid(*color), *radius),
+        RenderCommand::FillBrush {
+            rect,
+            brush,
+            radius,
+            ..
+        } => rounded_rect_vertices(*rect, brush, *radius),
         RenderCommand::StrokeRect {
             rect,
             brush,
@@ -1386,11 +1509,77 @@ fn brush_vertices(rect: Rect, brush: &Brush) -> Vec<ShapeVertex> {
     }
 }
 
-fn stroke_vertices(rect: Rect, brush: &Brush, width: f32, radius: f32) -> Vec<ShapeVertex> {
+fn rounded_rect_vertices(rect: Rect, brush: &Brush, radius: f32) -> Vec<ShapeVertex> {
+    if radius <= 0.0 {
+        return brush_vertices(rect, brush);
+    }
+    let points = rounded_points(rect, radius);
+    if points.is_empty() {
+        return Vec::new();
+    }
+    let center = [
+        rect.origin.x + rect.size.width * 0.5,
+        rect.origin.y + rect.size.height * 0.5,
+    ];
+    let mut vertices = Vec::with_capacity(points.len() * 3);
+    for index in 0..points.len() {
+        let next = (index + 1) % points.len();
+        vertices.extend([
+            brush_vertex(brush, center[0], center[1]),
+            brush_vertex(brush, points[index][0], points[index][1]),
+            brush_vertex(brush, points[next][0], points[next][1]),
+        ]);
+    }
+    vertices
+}
+
+fn rounded_points(rect: Rect, radius: f32) -> Vec<[f32; 2]> {
+    const SEGMENTS: usize = 8;
+    let radius = radius
+        .max(0.0)
+        .min(rect.size.width.min(rect.size.height) * 0.5);
+    if rect.size.width <= 0.0 || rect.size.height <= 0.0 {
+        return Vec::new();
+    }
+    let x = rect.origin.x;
+    let y = rect.origin.y;
+    let right = x + rect.size.width;
+    let bottom = y + rect.size.height;
+    let corners = [
+        (x + radius, y + radius, std::f32::consts::PI),
+        (right - radius, y + radius, 1.5 * std::f32::consts::PI),
+        (right - radius, bottom - radius, 0.0),
+        (x + radius, bottom - radius, 0.5 * std::f32::consts::PI),
+    ];
+    let mut points = Vec::with_capacity(SEGMENTS * 4);
+    for (cx, cy, start) in corners {
+        for step in 0..SEGMENTS {
+            let angle = start + step as f32 * std::f32::consts::FRAC_PI_2 / SEGMENTS as f32;
+            points.push([cx + radius * angle.cos(), cy + radius * angle.sin()]);
+        }
+    }
+    points
+}
+
+fn brush_vertex(brush: &Brush, x: f32, y: f32) -> ShapeVertex {
     let color = match brush {
         Brush::Solid(color) => *color,
-        Brush::LinearGradient { stops, .. } => gradient_color(stops, 0.5),
+        Brush::LinearGradient { start, end, stops } => {
+            let dx = end.x - start.x;
+            let dy = end.y - start.y;
+            let denominator = dx * dx + dy * dy;
+            let position = if denominator > 0.0 {
+                ((x - start.x) * dx + (y - start.y) * dy) / denominator
+            } else {
+                0.0
+            };
+            gradient_color(stops, position)
+        }
     };
+    vertex(x, y, rgba(color))
+}
+
+fn stroke_vertices(rect: Rect, brush: &Brush, width: f32, radius: f32) -> Vec<ShapeVertex> {
     let x = rect.origin.x;
     let y = rect.origin.y;
     let r = x + rect.size.width;
@@ -1403,30 +1592,30 @@ fn stroke_vertices(rect: Rect, brush: &Brush, width: f32, radius: f32) -> Vec<Sh
     let radius = radius.max(0.0).min(min_dimension * 0.5);
     if radius == 0.0 {
         return vec![
-            vertex(x, y, rgba(color)),
-            vertex(r, y, rgba(color)),
-            vertex(r, y + width, rgba(color)),
-            vertex(x, y, rgba(color)),
-            vertex(r, y + width, rgba(color)),
-            vertex(x, y + width, rgba(color)),
-            vertex(x, b - width, rgba(color)),
-            vertex(r, b - width, rgba(color)),
-            vertex(r, b, rgba(color)),
-            vertex(x, b - width, rgba(color)),
-            vertex(r, b, rgba(color)),
-            vertex(x, b, rgba(color)),
-            vertex(x, y + width, rgba(color)),
-            vertex(x + width, y + width, rgba(color)),
-            vertex(x + width, b - width, rgba(color)),
-            vertex(x, y + width, rgba(color)),
-            vertex(x + width, b - width, rgba(color)),
-            vertex(x, b - width, rgba(color)),
-            vertex(r - width, y + width, rgba(color)),
-            vertex(r, y + width, rgba(color)),
-            vertex(r, b - width, rgba(color)),
-            vertex(r - width, y + width, rgba(color)),
-            vertex(r, b - width, rgba(color)),
-            vertex(r - width, b - width, rgba(color)),
+            brush_vertex(brush, x, y),
+            brush_vertex(brush, r, y),
+            brush_vertex(brush, r, y + width),
+            brush_vertex(brush, x, y),
+            brush_vertex(brush, r, y + width),
+            brush_vertex(brush, x, y + width),
+            brush_vertex(brush, x, b - width),
+            brush_vertex(brush, r, b - width),
+            brush_vertex(brush, r, b),
+            brush_vertex(brush, x, b - width),
+            brush_vertex(brush, r, b),
+            brush_vertex(brush, x, b),
+            brush_vertex(brush, x, y + width),
+            brush_vertex(brush, x + width, y + width),
+            brush_vertex(brush, x + width, b - width),
+            brush_vertex(brush, x, y + width),
+            brush_vertex(brush, x + width, b - width),
+            brush_vertex(brush, x, b - width),
+            brush_vertex(brush, r - width, y + width),
+            brush_vertex(brush, r, y + width),
+            brush_vertex(brush, r, b - width),
+            brush_vertex(brush, r - width, y + width),
+            brush_vertex(brush, r, b - width),
+            brush_vertex(brush, r - width, b - width),
         ];
     }
     let mut vertices = Vec::new();
@@ -1438,7 +1627,7 @@ fn stroke_vertices(rect: Rect, brush: &Brush, width: f32, radius: f32) -> Vec<Sh
         [r - radius, y],
         [r - inner, y + width],
         [x + inner, y + width],
-        rgba(color),
+        brush,
     );
     extend_quad(
         &mut vertices,
@@ -1446,7 +1635,7 @@ fn stroke_vertices(rect: Rect, brush: &Brush, width: f32, radius: f32) -> Vec<Sh
         [r, b - radius],
         [r - width, b - inner],
         [r - width, y + inner],
-        rgba(color),
+        brush,
     );
     extend_quad(
         &mut vertices,
@@ -1454,7 +1643,7 @@ fn stroke_vertices(rect: Rect, brush: &Brush, width: f32, radius: f32) -> Vec<Sh
         [r - radius, b],
         [r - inner, b - width],
         [x + inner, b - width],
-        rgba(color),
+        brush,
     );
     extend_quad(
         &mut vertices,
@@ -1462,7 +1651,7 @@ fn stroke_vertices(rect: Rect, brush: &Brush, width: f32, radius: f32) -> Vec<Sh
         [x, y + radius],
         [x + width, y + inner],
         [x + width, b - inner],
-        rgba(color),
+        brush,
     );
 
     for (cx, cy, start) in [
@@ -1479,12 +1668,12 @@ fn stroke_vertices(rect: Rect, brush: &Brush, width: f32, radius: f32) -> Vec<Sh
             let inner0 = [cx + inner * a0.cos(), cy + inner * a0.sin()];
             let inner1 = [cx + inner * a1.cos(), cy + inner * a1.sin()];
             vertices.extend([
-                vertex(outer0[0], outer0[1], rgba(color)),
-                vertex(outer1[0], outer1[1], rgba(color)),
-                vertex(inner1[0], inner1[1], rgba(color)),
-                vertex(outer0[0], outer0[1], rgba(color)),
-                vertex(inner1[0], inner1[1], rgba(color)),
-                vertex(inner0[0], inner0[1], rgba(color)),
+                brush_vertex(brush, outer0[0], outer0[1]),
+                brush_vertex(brush, outer1[0], outer1[1]),
+                brush_vertex(brush, inner1[0], inner1[1]),
+                brush_vertex(brush, outer0[0], outer0[1]),
+                brush_vertex(brush, inner1[0], inner1[1]),
+                brush_vertex(brush, inner0[0], inner0[1]),
             ]);
         }
     }
@@ -1497,15 +1686,15 @@ fn extend_quad(
     outer1: [f32; 2],
     inner1: [f32; 2],
     inner0: [f32; 2],
-    color: [f32; 4],
+    brush: &Brush,
 ) {
     vertices.extend([
-        vertex(outer0[0], outer0[1], color),
-        vertex(outer1[0], outer1[1], color),
-        vertex(inner1[0], inner1[1], color),
-        vertex(outer0[0], outer0[1], color),
-        vertex(inner1[0], inner1[1], color),
-        vertex(inner0[0], inner0[1], color),
+        brush_vertex(brush, outer0[0], outer0[1]),
+        brush_vertex(brush, outer1[0], outer1[1]),
+        brush_vertex(brush, inner1[0], inner1[1]),
+        brush_vertex(brush, outer0[0], outer0[1]),
+        brush_vertex(brush, inner1[0], inner1[1]),
+        brush_vertex(brush, inner0[0], inner0[1]),
     ]);
 }
 
@@ -1672,6 +1861,11 @@ fn normalized_scale(scale_factor: f32) -> f32 {
     } else {
         1.0
     }
+}
+
+fn aligned_uniform_stride(size: u64, alignment: u64) -> u64 {
+    let alignment = alignment.max(1);
+    size.div_ceil(alignment) * alignment
 }
 
 fn physical_text_extent(logical_size: f32, scale_factor: f32) -> u32 {
@@ -2241,6 +2435,23 @@ mod tests {
     }
 
     #[test]
+    fn rounded_background_generates_corner_geometry() {
+        let vertices = rounded_rect_vertices(
+            Rect::new(0.0, 0.0, 100.0, 40.0),
+            &Brush::Solid(Color::WHITE),
+            8.0,
+        );
+
+        assert_eq!(vertices.len(), 96);
+        assert!(vertices.iter().all(|vertex| {
+            vertex.position[0] >= 0.0
+                && vertex.position[0] <= 100.0
+                && vertex.position[1] >= 0.0
+                && vertex.position[1] <= 40.0
+        }));
+    }
+
+    #[test]
     fn square_stroke_contains_all_four_edges() {
         let brush = Brush::Solid(Color::BLACK);
         let vertices = stroke_vertices(Rect::new(0.0, 0.0, 100.0, 40.0), &brush, 1.0, 0.0);
@@ -2277,6 +2488,42 @@ mod tests {
     }
 
     #[test]
+    fn gradient_stroke_interpolates_at_each_vertex() {
+        let brush = Brush::LinearGradient {
+            start: Offset::new(0.0, 0.0),
+            end: Offset::new(100.0, 0.0),
+            stops: vec![
+                GradientStop {
+                    position: 0.0,
+                    color: Color::BLACK,
+                },
+                GradientStop {
+                    position: 1.0,
+                    color: Color::WHITE,
+                },
+            ],
+        };
+        let vertices = stroke_vertices(Rect::new(0.0, 0.0, 100.0, 40.0), &brush, 1.0, 4.0);
+
+        assert!(
+            vertices
+                .iter()
+                .any(|vertex| vertex.color == [0.0, 0.0, 0.0, 1.0])
+        );
+        assert!(
+            vertices
+                .iter()
+                .any(|vertex| vertex.color == [1.0, 1.0, 1.0, 1.0])
+        );
+    }
+
+    #[test]
+    fn uniform_stride_respects_device_alignment() {
+        assert_eq!(aligned_uniform_stride(176, 256), 256);
+        assert_eq!(aligned_uniform_stride(176, 0), 176);
+    }
+
+    #[test]
     fn zero_width_or_empty_rect_produces_no_stroke_geometry() {
         let brush = Brush::Solid(Color::BLACK);
         assert!(stroke_vertices(Rect::new(0.0, 0.0, 20.0, 20.0), &brush, 0.0, 4.0).is_empty());
@@ -2289,11 +2536,13 @@ mod tests {
             node: karu::NodeId(1),
             rect: Rect::new(0.0, 0.0, 10.0, 10.0),
             color: Color::rgb(1.0, 0.0, 0.0),
+            radius: 0.0,
         };
         let second = RenderCommand::FillRect {
             node: karu::NodeId(2),
             rect: Rect::new(20.0, 30.0, 40.0, 50.0),
             color: Color::rgb(0.0, 1.0, 0.0),
+            radius: 0.0,
         };
         let first_vertices = shape_vertices(&first).expect("first shape has vertices");
         let second_vertices = shape_vertices(&second).expect("second shape has vertices");

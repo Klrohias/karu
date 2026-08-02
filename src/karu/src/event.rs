@@ -125,6 +125,12 @@ pub struct InteractionState {
     pub focused: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PointerDispatchResult {
+    pub handled: bool,
+    pub interaction_changed: bool,
+}
+
 type PointerCallback = Rc<RefCell<dyn FnMut(PointerEvent)>>;
 type TextPointerCallback = Rc<RefCell<dyn FnMut(TextPointerEvent, &mut dyn TextLayoutEngine)>>;
 type ClickCallback = Rc<RefCell<dyn FnMut()>>;
@@ -272,18 +278,22 @@ impl EventRegistry {
         tree: &LayoutNode,
         event: PointerEvent,
         layout: &mut dyn TextLayoutEngine,
-    ) -> bool {
+    ) -> PointerDispatchResult {
         let pointer = PointerId::from(event.kind);
         let hit = hit_test(tree, event.position);
         let previous = self.pointers.get(&pointer).copied();
         let mut handled = hit.is_some();
+        let mut interaction_changed =
+            previous.map_or(hit.is_some(), |record| record.hovered != hit);
 
         match event.phase {
             PointerPhase::Down => {
                 if event.primary {
                     let was_focused = self.active_text_input == hit;
-                    self.active_text_input =
+                    let next_active_text_input =
                         hit.filter(|node| self.text_input_handlers.contains_key(node));
+                    interaction_changed |= self.active_text_input != next_active_text_input;
+                    self.active_text_input = next_active_text_input;
                     self.pointers.insert(
                         pointer,
                         PointerRecord {
@@ -292,6 +302,10 @@ impl EventRegistry {
                         },
                     );
                     if let Some(node) = hit {
+                        interaction_changed |= !self
+                            .interactions
+                            .get(&node)
+                            .is_some_and(|state| state.pressed);
                         self.set_pressed(node, true);
                         self.invoke_text_pointer_handler(tree, node, event, was_focused, layout);
                     }
@@ -305,7 +319,13 @@ impl EventRegistry {
                 });
                 record.hovered = hit;
                 if let Some(node) = record.target {
-                    self.set_pressed(node, hit == Some(node));
+                    let pressed = hit == Some(node);
+                    interaction_changed |= self
+                        .interactions
+                        .get(&node)
+                        .is_some_and(|state| state.pressed)
+                        != pressed;
+                    self.set_pressed(node, pressed);
                     self.invoke_text_pointer_handler(tree, node, event, true, layout);
                     handled = true;
                 }
@@ -316,6 +336,10 @@ impl EventRegistry {
                 if let Some(record) = record
                     && let Some(node) = record.target
                 {
+                    interaction_changed |= self
+                        .interactions
+                        .get(&node)
+                        .is_some_and(|state| state.pressed);
                     self.set_pressed(node, false);
                     self.invoke_text_pointer_handler(tree, node, event, true, layout);
                     handled = true;
@@ -335,6 +359,10 @@ impl EventRegistry {
                 if let Some(record) = self.pointers.remove(&pointer).or(previous)
                     && let Some(node) = record.target
                 {
+                    interaction_changed |= self
+                        .interactions
+                        .get(&node)
+                        .is_some_and(|state| state.pressed);
                     self.set_pressed(node, false);
                 }
                 handled |= self.invoke_pointer_handlers(hit, event);
@@ -342,7 +370,10 @@ impl EventRegistry {
         }
 
         self.recompute_hover_states();
-        handled
+        PointerDispatchResult {
+            handled,
+            interaction_changed,
+        }
     }
 
     pub(crate) fn dispatch_scroll(&mut self, tree: &LayoutNode, event: ScrollEvent) -> bool {

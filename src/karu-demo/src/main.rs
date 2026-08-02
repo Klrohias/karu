@@ -6,6 +6,7 @@ use karu::{
     remember_mutable_state, remember_scroll_state, remember_text_field_state,
 };
 use karu_backend_quad::Quad;
+use karu_backend_wgpu::Wgpu;
 use karu_basic::{Button, ButtonOptions, Surface, SurfaceOptions};
 
 const BACKGROUND: Color = Color::rgb(0.94, 0.95, 0.97);
@@ -246,8 +247,8 @@ fn TodoApp() {
                                     .fill_max_width()
                                     .min_size(0.0, 78.0)
                                     .padding(20.0)
-                                    .background(NAVY)
                                     .border_radius(12.0)
+                                    .background(NAVY)
                                     .clip(),
                             )
                             .horizontal_arrangement(Arrangement::SpaceBetween)

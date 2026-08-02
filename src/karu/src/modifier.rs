@@ -777,7 +777,7 @@ impl ModifierElement for Scroll {
                 ScrollAxis::Horizontal => event.delta.x,
                 ScrollAxis::Vertical => event.delta.y,
             };
-            state.scroll_by(delta) != 0.0
+            state.scroll_by_without_invalidation(delta) != 0.0
         });
     }
     fn as_any(&self) -> &dyn Any {

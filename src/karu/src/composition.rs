@@ -327,11 +327,11 @@ impl Composer {
         event: PointerEvent,
         layout: &mut dyn TextLayoutEngine,
     ) -> bool {
-        let handled = self.inner.borrow_mut().events.dispatch(tree, event, layout);
-        if handled {
+        let result = self.inner.borrow_mut().events.dispatch(tree, event, layout);
+        if result.interaction_changed {
             self.inner.borrow().invalidation.mark_dirty();
         }
-        handled
+        result.handled
     }
 
     pub(crate) fn dispatch_scroll_event(
@@ -339,11 +339,7 @@ impl Composer {
         tree: &crate::layout::LayoutNode,
         event: ScrollEvent,
     ) -> bool {
-        let handled = self.inner.borrow_mut().events.dispatch_scroll(tree, event);
-        if handled {
-            self.inner.borrow().invalidation.mark_dirty();
-        }
-        handled
+        self.inner.borrow_mut().events.dispatch_scroll(tree, event)
     }
 
     pub(crate) fn dispatch_text_input_event(
@@ -490,8 +486,21 @@ impl Composition {
         let Some(result) = self.last_result.as_ref() else {
             return false;
         };
-        self.composer
-            .dispatch_scroll_event(&result.render_tree.root.clone(), event)
+        let handled = self
+            .composer
+            .dispatch_scroll_event(&result.render_tree.root, event);
+        if handled {
+            let result = self
+                .last_result
+                .as_mut()
+                .expect("composition result remains available during scroll dispatch");
+            if scroll_requires_recomposition(&result.render_tree.root) {
+                self.composer.inner.borrow().invalidation.mark_dirty();
+            } else {
+                refresh_scroll_geometry(&mut result.render_tree.root, &mut result.commands);
+            }
+        }
+        handled
     }
 
     pub fn dispatch_text_input_event(&mut self, event: TextInputEvent) -> bool {
@@ -605,6 +614,60 @@ impl Composition {
         self.last_result = Some(result.clone());
         result
     }
+}
+
+fn refresh_scroll_geometry(
+    node: &mut crate::layout::LayoutNode,
+    commands: &mut [crate::renderer::RenderCommand],
+) -> bool {
+    let mut changed = false;
+    if let Some(scroll) = &node.scroll {
+        let next = scroll.state.value();
+        let delta = node.scroll_offset - next;
+        if delta != 0.0 {
+            let mut descendants = HashSet::new();
+            collect_node_ids(&node.children, &mut descendants);
+            for child in &mut node.children {
+                match scroll.axis {
+                    crate::ScrollAxis::Horizontal => {
+                        crate::layout::translate_node(child, delta, 0.0)
+                    }
+                    crate::ScrollAxis::Vertical => crate::layout::translate_node(child, 0.0, delta),
+                }
+            }
+            match scroll.axis {
+                crate::ScrollAxis::Horizontal => {
+                    crate::renderer::translate_commands(commands, &descendants, delta, 0.0)
+                }
+                crate::ScrollAxis::Vertical => {
+                    crate::renderer::translate_commands(commands, &descendants, 0.0, delta)
+                }
+            }
+            node.scroll_offset = next;
+            changed = true;
+        }
+    }
+
+    for child in &mut node.children {
+        changed |= refresh_scroll_geometry(child, commands);
+    }
+    changed
+}
+
+fn collect_node_ids(nodes: &[crate::layout::LayoutNode], ids: &mut HashSet<crate::NodeId>) {
+    for node in nodes {
+        ids.insert(node.id);
+        collect_node_ids(&node.children, ids);
+    }
+}
+
+fn scroll_requires_recomposition(node: &crate::layout::LayoutNode) -> bool {
+    if node.scroll.as_ref().is_some_and(|scroll| {
+        scroll.state.recompose_on_scroll() && scroll.state.value() != node.scroll_offset
+    }) {
+        return true;
+    }
+    node.children.iter().any(scroll_requires_recomposition)
 }
 
 impl Drop for Composition {
