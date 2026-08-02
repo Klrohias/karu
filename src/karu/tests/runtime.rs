@@ -1,16 +1,230 @@
 #[allow(unused_imports)]
 use karu::{
-    Animatable, App, AppBackend, AppConfig, Arrangement, BasicTextField, Color, Column,
-    ColumnOptions, Composition, CompositionLocal, Constraints, CrossAxisAlignment, ElementKind,
-    FocusRequester, FocusState, KeyCode, KeyEvent, KeyModifiers, LazyColumn, LazyColumnOptions,
-    Modifier, MutableState, Offset, PointerEvent, PointerKind, PointerPhase, RecomposeRequest,
-    RenderCommand, Row, RowOptions, ScrollEvent, ScrollState, TaskHandle, TaskRuntime, Text,
-    TextFieldOptions, TextFieldState, TextInputEvent, TextOptions, TweenSpec, composable,
-    composition_local_of, disposable_effect, key, mutable_state_of, provide,
+    Animatable, App, AppBackend, AppConfig, Applier, Arrangement, BasicTextField, CaretPosition,
+    Clipboard, ClipboardError, Color, Column, ColumnOptions, Composition, CompositionLocal,
+    Constraints, CrossAxisAlignment, Element, ElementApplier, ElementKind, FocusRequester,
+    FocusState, HeadlessBackend, HeadlessTextLayout, KeyCode, KeyEvent, KeyModifiers, LazyColumn,
+    LazyColumnOptions, Modifier, MutableState, Offset, PointerEvent, PointerKind, PointerPhase,
+    RecomposeRequest, Recomposer, Rect, RenderCommand, Row, RowOptions, ScrollEvent, ScrollState,
+    Size, TaskHandle, TaskRuntime, Text, TextEditCommand, TextFieldOptions, TextFieldState,
+    TextInputCommand, TextInputEvent, TextLayoutEngine, TextOptions, TextWrap, TweenSpec,
+    composable, composition_local_of, disposable_effect, key, mutable_state_of, provide,
     remember_mutable_state, side_effect,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
+
+#[test]
+fn text_layout_hits_measured_grapheme_intervals() {
+    let mut renderer = HeadlessTextLayout;
+
+    assert_eq!(
+        renderer.hit_test_text(
+            "a你b",
+            14.0,
+            f32::INFINITY,
+            TextWrap::NoWrap,
+            Offset::new(3.0, 4.0)
+        ),
+        0
+    );
+    assert_eq!(
+        renderer.hit_test_text(
+            "a你b",
+            14.0,
+            f32::INFINITY,
+            TextWrap::NoWrap,
+            Offset::new(12.0, 4.0)
+        ),
+        1
+    );
+    assert_eq!(
+        renderer.hit_test_text(
+            "a你b",
+            14.0,
+            f32::INFINITY,
+            TextWrap::NoWrap,
+            Offset::new(21.0, 4.0)
+        ),
+        4
+    );
+    assert_eq!(
+        renderer
+            .caret_position("a你b", 14.0, f32::INFINITY, TextWrap::NoWrap, 4)
+            .position
+            .x,
+        22.0
+    );
+}
+
+struct CountingTextLayout {
+    calls: Rc<std::cell::Cell<usize>>,
+    layout: HeadlessTextLayout,
+}
+
+impl TextLayoutEngine for CountingTextLayout {
+    fn measure_text(&mut self, text: &str, font_size: f32, max_width: f32, wrap: TextWrap) -> Size {
+        self.calls.set(self.calls.get() + 1);
+        self.layout.measure_text(text, font_size, max_width, wrap)
+    }
+    fn caret_position(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        max_width: f32,
+        wrap: TextWrap,
+        offset: usize,
+    ) -> CaretPosition {
+        self.calls.set(self.calls.get() + 1);
+        self.layout
+            .caret_position(text, font_size, max_width, wrap, offset)
+    }
+    fn hit_test_text(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        max_width: f32,
+        wrap: TextWrap,
+        position: Offset,
+    ) -> usize {
+        self.calls.set(self.calls.get() + 1);
+        self.layout
+            .hit_test_text(text, font_size, max_width, wrap, position)
+    }
+    fn text_line_range(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        max_width: f32,
+        wrap: TextWrap,
+        offset: usize,
+    ) -> std::ops::Range<usize> {
+        self.calls.set(self.calls.get() + 1);
+        self.layout
+            .text_line_range(text, font_size, max_width, wrap, offset)
+    }
+    fn selection_rects(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        max_width: f32,
+        wrap: TextWrap,
+        range: std::ops::Range<usize>,
+    ) -> Vec<Rect> {
+        self.calls.set(self.calls.get() + 1);
+        self.layout
+            .selection_rects(text, font_size, max_width, wrap, range)
+    }
+}
+
+#[composable]
+fn SharedRendererContent() {
+    Text("measured", TextOptions::default());
+}
+
+#[test]
+fn composition_uses_renderer_text_queries_for_layout_and_commands() {
+    let calls = Rc::new(std::cell::Cell::new(0));
+    let mut composition = Composition::new(SharedRendererContent);
+    let mut layout = CountingTextLayout {
+        calls: calls.clone(),
+        layout: HeadlessTextLayout,
+    };
+    let mut backend = HeadlessBackend::default();
+    composition.render_with(&mut layout, &mut backend).unwrap();
+    let result = composition
+        .last_result()
+        .expect("composition result exists");
+    let command = only_text_command(&result.commands);
+    let RenderCommand::DrawText { node: node_id, .. } = command else {
+        unreachable!()
+    };
+    let node = result
+        .render_tree
+        .root
+        .find(*node_id)
+        .expect("text node exists");
+
+    assert_eq!(calls.get(), 1);
+    assert!(node.text_field.is_none());
+}
+
+#[test]
+fn public_ui_functions_build_nodes_without_macro_rewriting() {
+    let mut composition = Composition::new(|| {
+        Column(ColumnOptions::default(), || {
+            Text("public", TextOptions::default());
+        });
+    });
+
+    let result = composition.compose();
+    assert!(matches!(result.root.children[0].kind, ElementKind::Column));
+    assert!(matches!(
+        result.root.children[0].children[0].kind,
+        ElementKind::Text(ref value) if value == "public"
+    ));
+}
+
+#[derive(Default)]
+struct MemoryClipboard {
+    text: Option<String>,
+}
+
+impl Clipboard for MemoryClipboard {
+    fn get_text(&mut self) -> Result<Option<String>, ClipboardError> {
+        Ok(self.text.clone())
+    }
+
+    fn set_text(&mut self, text: &str) -> Result<(), ClipboardError> {
+        self.text = Some(text.to_string());
+        Ok(())
+    }
+}
+
+#[test]
+fn clipboard_is_a_backend_capability_with_a_testable_contract() {
+    let mut clipboard = MemoryClipboard::default();
+    assert_eq!(clipboard.get_text().unwrap(), None);
+    clipboard.set_text("copied").unwrap();
+    assert_eq!(clipboard.get_text().unwrap().as_deref(), Some("copied"));
+}
+
+#[test]
+fn element_applier_owns_tree_mutation() {
+    let mut applier = ElementApplier::new(Element::new(
+        karu::NodeId(0),
+        ElementKind::Root,
+        Modifier::empty(),
+    ));
+    applier.begin_node(Element::new(
+        karu::NodeId(1),
+        ElementKind::Text("child".to_string()),
+        Modifier::empty(),
+    ));
+    applier.end_node();
+
+    let root = applier.finish().expect("balanced applier");
+    assert_eq!(root.children.len(), 1);
+    assert_eq!(root.children[0].id, karu::NodeId(1));
+}
+
+#[test]
+fn recomposer_only_runs_dirty_compositions() {
+    let mut composition = Composition::new(|| Text("frame", TextOptions::default()));
+    let mut recomposer = Recomposer::new();
+    let mut layout = HeadlessTextLayout;
+
+    assert!(
+        recomposer
+            .recompose_with(&mut composition, &mut layout)
+            .is_some()
+    );
+    assert!(
+        recomposer
+            .recompose_with(&mut composition, &mut layout)
+            .is_none()
+    );
+}
 
 #[composable]
 fn CounterApp(state_out: Rc<RefCell<Option<MutableState<i32>>>>) {
@@ -165,6 +379,48 @@ fn state_updates_enqueue_recompose_requests_without_running_root() {
     assert_eq!(text_value(second_text), "2");
     assert_eq!(*render_count.borrow(), 2);
     assert!(!composition.is_dirty());
+}
+
+#[composable]
+fn ParameterizedChild(value: String, renders: Rc<RefCell<usize>>) {
+    *renders.borrow_mut() += 1;
+    Text(value, TextOptions::default());
+}
+
+#[composable]
+fn ParameterizedParent(
+    state_out: Rc<RefCell<Option<MutableState<i32>>>>,
+    child_renders: Rc<RefCell<usize>>,
+) {
+    let state = remember_mutable_state(|| 0);
+    *state_out.borrow_mut() = Some(state.clone());
+    ParameterizedChild(state.get().to_string(), child_renders);
+}
+
+#[test]
+fn dirty_parent_does_not_reuse_children_with_stale_parameters() {
+    let state_out = Rc::new(RefCell::new(None));
+    let child_renders = Rc::new(RefCell::new(0));
+    let mut composition = {
+        let state_out = state_out.clone();
+        let child_renders = child_renders.clone();
+        Composition::new(move || ParameterizedParent(state_out.clone(), child_renders.clone()))
+    };
+    let mut recomposer = Recomposer::new();
+    let mut layout = HeadlessTextLayout;
+
+    let first = recomposer
+        .recompose_with(&mut composition, &mut layout)
+        .expect("initial composition");
+    assert_eq!(text_value(only_text_command(&first.commands)), "0");
+    assert_eq!(*child_renders.borrow(), 1);
+
+    state_out.borrow().as_ref().unwrap().set(1);
+    let second = recomposer
+        .recompose_with(&mut composition, &mut layout)
+        .expect("dirty composition");
+    assert_eq!(text_value(only_text_command(&second.commands)), "1");
+    assert_eq!(*child_renders.borrow(), 2);
 }
 
 #[composable]
@@ -499,52 +755,26 @@ fn text_field_handles_cursor_selection_shortcuts_and_history() {
     });
     assert_eq!(state.selected_text().as_deref(), Some("t"));
 
-    state.handle_key(KeyEvent {
-        code: KeyCode::A,
-        modifiers: KeyModifiers {
-            ctrl: true,
-            ..Default::default()
-        },
-        repeat: false,
-    });
-    let copied = state.handle_key(KeyEvent {
-        code: KeyCode::C,
-        modifiers: KeyModifiers {
-            ctrl: true,
-            ..Default::default()
-        },
-        repeat: false,
-    });
-    assert_eq!(copied.clipboard.as_deref(), Some("one two"));
+    state.handle_command(TextEditCommand::SelectAll);
+    let copied = state.handle_command(TextEditCommand::Copy);
+    assert_eq!(
+        copied.commands,
+        vec![TextInputCommand::Copy("one two".to_string())]
+    );
 
-    state.handle_key(KeyEvent {
-        code: KeyCode::X,
-        modifiers: KeyModifiers {
-            ctrl: true,
-            ..Default::default()
-        },
-        repeat: false,
-    });
+    let cut = state.handle_command(TextEditCommand::Cut);
+    assert_eq!(
+        cut.commands,
+        vec![TextInputCommand::Cut("one two".to_string())]
+    );
     assert_eq!(state.text(), "");
-    state.handle_key(KeyEvent {
-        code: KeyCode::Z,
-        modifiers: KeyModifiers {
-            ctrl: true,
-            ..Default::default()
-        },
-        repeat: false,
-    });
+    state.handle_command(TextEditCommand::Undo);
     assert_eq!(state.text(), "one two");
-    state.handle_key(KeyEvent {
-        code: KeyCode::Z,
-        modifiers: KeyModifiers {
-            ctrl: true,
-            shift: true,
-            ..Default::default()
-        },
-        repeat: false,
-    });
+    state.handle_command(TextEditCommand::Redo);
     assert_eq!(state.text(), "");
+
+    let paste = state.handle_command(TextEditCommand::Paste);
+    assert_eq!(paste.commands, vec![TextInputCommand::PasteRequest]);
 }
 
 #[test]
@@ -791,6 +1021,40 @@ fn basic_text_field_exposes_editing_state_and_semantics() {
 }
 
 #[test]
+fn basic_text_field_separates_character_input_from_edit_commands() {
+    let state = TextFieldState::new("draft");
+    let mut composition = Composition::new({
+        let state = state.clone();
+        move || TextFieldContent(state.clone())
+    });
+    composition.compose();
+
+    for text in ["a", "z", "x", "c", "v"] {
+        assert!(
+            composition.dispatch_text_input_event(TextInputEvent::Insert {
+                position: Offset::new(1.0, 1.0),
+                text: text.to_string(),
+            })
+        );
+    }
+    assert_eq!(state.text(), "draftazxcv");
+
+    composition.dispatch_text_input_event(TextInputEvent::Command {
+        position: Offset::new(1.0, 1.0),
+        command: TextEditCommand::SelectAll,
+    });
+    let copied = composition.dispatch_text_input_event_with_result(TextInputEvent::Command {
+        position: Offset::new(1.0, 1.0),
+        command: TextEditCommand::Copy,
+    });
+    assert_eq!(
+        copied.commands,
+        vec![TextInputCommand::Copy("draftazxcv".to_string())]
+    );
+    assert_eq!(state.text(), "draftazxcv");
+}
+
+#[test]
 fn basic_text_field_draws_a_cursor_and_supports_mouse_drag_selection() {
     let state = TextFieldState::new("abcd");
     let mut composition = Composition::new({
@@ -883,7 +1147,7 @@ fn text_input_prefers_the_active_field_over_pointer_position() {
         })
     );
 
-    assert_eq!(first.text(), "one!");
+    assert_eq!(first.text(), "!one");
     assert_eq!(second.text(), "two");
 }
 

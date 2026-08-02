@@ -1,6 +1,6 @@
 use karu::{
     BoxOptions, Brush, Color, Composition, Element, ElementKind, Modifier, Offset, PointerEvent,
-    PointerKind, PointerPhase, TextOptions, composable,
+    PointerKind, PointerPhase, RenderCommand, TextOptions, composable,
 };
 use karu_basic::{Button, ButtonOptions};
 use std::cell::Cell;
@@ -35,6 +35,17 @@ fn button_is_built_from_box_and_modifiers() {
     assert!(button.background.is_some());
     assert!(button.border.is_some());
     assert_eq!(button.bounds.size.height, 36.0);
+
+    let button_id = button.id;
+    assert!(result.commands.iter().any(|command| {
+        matches!(command, RenderCommand::PushClip(rect) if *rect == button.bounds)
+    }));
+    assert!(result.commands.iter().any(|command| {
+        matches!(command, RenderCommand::FillRect { node, .. } if *node == button_id)
+    }));
+    assert!(result.commands.iter().any(|command| {
+        matches!(command, RenderCommand::StrokeRect { node, .. } if *node == button_id)
+    }));
 }
 
 #[test]

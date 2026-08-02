@@ -5,6 +5,7 @@ mod event;
 mod foundation;
 mod layout;
 mod modifier;
+mod platform;
 mod renderer;
 mod state;
 mod text_layout;
@@ -16,15 +17,15 @@ pub use karu_macros::composable;
 
 pub use app::{App, AppBackend, AppConfig, AppRoot};
 pub use composition::{
-    Composer, Composition, CompositionError, CompositionId, CompositionLocal, CompositionResult,
-    RecomposeCallback, RecomposeRequest, RecomposeScopeId, TaskHandle, TaskRuntime,
-    composition_local_of, disposable_effect, key, launched_effect, provide, side_effect,
-    with_component_scope, with_current_composer,
+    Applier, Composer, Composition, CompositionError, CompositionId, CompositionLocal,
+    CompositionResult, ElementApplier, RecomposeCallback, RecomposeRequest, RecomposeScopeId,
+    Recomposer, TaskHandle, TaskRuntime, composition_local_of, disposable_effect, key,
+    launched_effect, provide, side_effect, with_component_scope, with_current_composer,
 };
 pub use element::{CustomElement, Element, ElementKind, NodeId};
 pub use event::{
     EventRegistry, InteractionState, KeyCode, KeyEvent, KeyModifiers, PointerEvent, PointerKind,
-    PointerPhase, ScrollEvent, TextInputEvent, TextPointerEvent,
+    PointerPhase, ScrollEvent, TextEditCommand, TextInputContext, TextInputEvent, TextPointerEvent,
 };
 pub use foundation::{
     Animatable, FocusRequester, FocusState, ScrollState, TextFieldState, TextFieldValue, TweenSpec,
@@ -39,9 +40,11 @@ pub use modifier::{
     ModifierElement, Padding, PaintChain, PaintInput, Role, RowCrossAlignment, Scroll, ScrollAxis,
     ScrollData, SemanticRole, Semantics, TestTag, TextColor, TextInput, Weight, WeightData,
 };
+pub use platform::{Clipboard, ClipboardError, NoopClipboard};
 pub use renderer::{
-    HeadlessOutput, HeadlessRenderer, ImageId, RenderCommand, RenderTree, Renderer,
-    TextInputResult, TextStyle, commands_for_tree_with_engine,
+    HeadlessBackend, HeadlessOutput, HeadlessTextLayout, ImageId, RenderBackend, RenderCommand,
+    RenderTree, TextInputCommand, TextInputResult, TextLayoutEngine, TextStyle,
+    commands_for_tree_with_layout,
 };
 pub use state::{
     DerivedState, MutableState, NeverEqual, SnapshotMutationPolicy, SnapshotStateList,
@@ -49,9 +52,7 @@ pub use state::{
     mutable_state_of, mutable_state_with_policy, remember, remember_keyed, remember_mutable_state,
     remember_mutable_state_with_policy, remember_updated_state,
 };
-pub use text_layout::{
-    BasicTextLayoutEngine, CaretPosition, TextLayout, TextLayoutEngine, TextLine, TextWrap,
-};
+pub use text_layout::{CaretAffinity, CaretPosition, TextWrap};
 pub use ui::{
     BasicTextField, Box, BoxOptions, Column, ColumnOptions, LazyColumn, LazyColumnOptions,
     LazyColumnScope, Row, RowOptions, Spacer, SpacerOptions, Text, TextFieldOptions, TextOptions,
@@ -61,7 +62,7 @@ pub use ui::{
 pub mod __private {
     pub use crate::composition::{
         disposable_effect, key, launched_effect, provide, side_effect, with_component_scope,
-        with_current_composer,
+        with_component_scope_unit, with_current_composer,
     };
     pub use crate::state::{
         remember, remember_keyed, remember_mutable_state, remember_updated_state,

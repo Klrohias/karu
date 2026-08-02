@@ -4,6 +4,7 @@ members = [
     "karu",
     "karu-basic",
     "karu-backend-quad",
+    "karu-backend-wgpu",
     "karu-macros",
     "karu-demo",
 ]

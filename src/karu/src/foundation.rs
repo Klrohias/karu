@@ -1,7 +1,11 @@
+use crate::renderer::{TextInputCommand, TextLayoutEngine};
 use crate::text_layout::{
-    TextLayout, grapheme_boundaries, next_grapheme_boundary, previous_grapheme_boundary,
+    TextWrap, grapheme_boundaries, next_grapheme_boundary, previous_grapheme_boundary,
 };
-use crate::{KeyCode, KeyEvent, MutableState, TextInputResult, mutable_state_of};
+use crate::{
+    KeyCode, KeyEvent, MutableState, Offset, Size, TextEditCommand, TextInputResult,
+    mutable_state_of,
+};
 use std::cell::RefCell;
 use std::fmt;
 use std::ops::Range;
@@ -155,6 +159,15 @@ pub struct TextFieldState {
     history: Rc<RefCell<TextHistory>>,
     composition_before: Rc<RefCell<Option<TextFieldValue>>>,
     scroll_offset: Rc<RefCell<crate::Offset>>,
+    desired_x: Rc<RefCell<Option<f32>>>,
+}
+
+struct TextNavigation<'a> {
+    text: &'a str,
+    font_size: f32,
+    max_width: f32,
+    wrap: TextWrap,
+    layout: &'a mut dyn TextLayoutEngine,
 }
 
 #[derive(Default)]
@@ -174,6 +187,7 @@ impl TextFieldState {
             history: Rc::new(RefCell::new(TextHistory::default())),
             composition_before: Rc::new(RefCell::new(None)),
             scroll_offset: Rc::new(RefCell::new(crate::Offset::ZERO)),
+            desired_x: Rc::new(RefCell::new(None)),
         }
     }
     pub fn value(&self) -> TextFieldValue {
@@ -186,6 +200,7 @@ impl TextFieldState {
         *self.active.borrow_mut() = value.selection.end;
         *self.composition_before.borrow_mut() = None;
         *self.scroll_offset.borrow_mut() = crate::Offset::ZERO;
+        *self.desired_x.borrow_mut() = None;
         self.value.set(value);
     }
     pub fn edit(&self, edit: impl FnOnce(&mut TextFieldValue)) {
@@ -284,6 +299,7 @@ impl TextFieldState {
 
     pub fn set_cursor(&self, cursor: usize) {
         let cursor = character_boundary_at_or_before(&self.text(), cursor);
+        *self.desired_x.borrow_mut() = None;
         self.select_range(cursor..cursor, None);
     }
 
@@ -292,47 +308,41 @@ impl TextFieldState {
         self.set_cursor(cursor);
     }
 
-    pub fn set_cursor_from_position(&self, position: crate::Offset, layout: &TextLayout) {
-        self.set_cursor(layout.hit_test(crate::Offset::new(
-            position.x + self.scroll_offset().x,
-            position.y + self.scroll_offset().y,
-        )));
-    }
-
-    pub(crate) fn begin_selection_from_x(&self, x: f32, font_size: f32) {
-        *self.anchor.borrow_mut() = Some(self.cursor_from_x(x, font_size));
+    pub fn set_cursor_from_position(
+        &self,
+        position: crate::Offset,
+        text: &str,
+        font_size: f32,
+        max_width: f32,
+        wrap: TextWrap,
+        layout: &mut dyn TextLayoutEngine,
+    ) {
+        self.set_cursor(layout.hit_test_text(text, font_size, max_width, wrap, position));
     }
 
     pub(crate) fn begin_selection_from_position(
         &self,
         position: crate::Offset,
-        layout: &TextLayout,
+        text: &str,
+        font_size: f32,
+        max_width: f32,
+        wrap: TextWrap,
+        layout: &mut dyn TextLayoutEngine,
     ) {
-        *self.anchor.borrow_mut() = Some(layout.hit_test(crate::Offset::new(
-            position.x + self.scroll_offset().x,
-            position.y + self.scroll_offset().y,
-        )));
-    }
-
-    pub(crate) fn extend_selection_from_x(&self, x: f32, font_size: f32) {
-        let cursor = self.cursor_from_x(x, font_size);
-        let anchor = self
-            .anchor
-            .borrow()
-            .unwrap_or_else(|| self.value.get().selection.start);
-        self.select_range(anchor.min(cursor)..anchor.max(cursor), Some(anchor));
-        *self.active.borrow_mut() = cursor;
+        *self.anchor.borrow_mut() =
+            Some(layout.hit_test_text(text, font_size, max_width, wrap, position));
     }
 
     pub(crate) fn extend_selection_from_position(
         &self,
         position: crate::Offset,
-        layout: &TextLayout,
+        text: &str,
+        font_size: f32,
+        max_width: f32,
+        wrap: TextWrap,
+        layout: &mut dyn TextLayoutEngine,
     ) {
-        let cursor = layout.hit_test(crate::Offset::new(
-            position.x + self.scroll_offset().x,
-            position.y + self.scroll_offset().y,
-        ));
+        let cursor = layout.hit_test_text(text, font_size, max_width, wrap, position);
         let anchor = self
             .anchor
             .borrow()
@@ -345,23 +355,40 @@ impl TextFieldState {
         *self.scroll_offset.borrow()
     }
 
-    pub fn ensure_cursor_visible(&self, layout: &TextLayout, viewport: crate::Size) {
-        let caret = layout.caret(self.active_endpoint());
+    pub fn ensure_cursor_visible(
+        &self,
+        text: &str,
+        font_size: f32,
+        max_width: f32,
+        wrap: TextWrap,
+        text_size: Size,
+        viewport: Size,
+        layout: &mut dyn TextLayoutEngine,
+    ) {
+        let caret = layout.caret_position(text, font_size, max_width, wrap, self.active_endpoint());
         let mut scroll = self.scroll_offset.borrow_mut();
-        let right = scroll.x + viewport.width;
-        if caret.position.x < scroll.x {
-            scroll.x = caret.position.x.max(0.0);
-        } else if caret.position.x > right {
-            scroll.x = (caret.position.x - viewport.width).max(0.0);
+        if text_size.height > caret.height {
+            scroll.x = 0.0;
+        } else {
+            let right = scroll.x + viewport.width;
+            if caret.position.x < scroll.x {
+                scroll.x = caret.position.x.max(0.0);
+            } else if caret.position.x > right {
+                scroll.x = (caret.position.x - viewport.width).max(0.0);
+            }
         }
-        let bottom = scroll.y + viewport.height;
-        if caret.position.y < scroll.y {
-            scroll.y = caret.position.y.max(0.0);
-        } else if caret.position.y + caret.height > bottom {
-            scroll.y = (caret.position.y + caret.height - viewport.height).max(0.0);
+        if text_size.height > caret.height {
+            let bottom = scroll.y + viewport.height;
+            if caret.position.y < scroll.y {
+                scroll.y = caret.position.y.max(0.0);
+            } else if caret.position.y + caret.height > bottom {
+                scroll.y = (caret.position.y + caret.height - viewport.height).max(0.0);
+            }
+        } else {
+            scroll.y = 0.0;
         }
-        let max_x = (layout.size.width - viewport.width).max(0.0);
-        let max_y = (layout.size.height - viewport.height).max(0.0);
+        let max_x = (text_size.width - viewport.width).max(0.0);
+        let max_y = (text_size.height - viewport.height).max(0.0);
         scroll.x = scroll.x.min(max_x);
         scroll.y = scroll.y.min(max_y);
     }
@@ -381,39 +408,67 @@ impl TextFieldState {
     }
 
     pub fn handle_key(&self, event: KeyEvent) -> TextInputResult {
-        let command = event.modifiers.command();
-        match (event.code, command, event.modifiers.shift) {
-            (KeyCode::A, true, _) => {
+        self.handle_key_internal(event, None)
+    }
+
+    pub fn handle_command(&self, command: TextEditCommand) -> TextInputResult {
+        match command {
+            TextEditCommand::SelectAll => {
                 self.select_all();
                 TextInputResult::handled()
             }
-            (KeyCode::C, true, _) => TextInputResult {
-                handled: true,
-                clipboard: self.selected_text(),
-            },
-            (KeyCode::X, true, _) => {
-                let clipboard = self.selected_text();
-                if clipboard.is_some() {
-                    self.replace_selection("");
-                }
-                TextInputResult {
-                    handled: true,
-                    clipboard,
-                }
+            TextEditCommand::Copy => self
+                .selected_text()
+                .map_or_else(TextInputResult::handled, |text| {
+                    TextInputResult::command(TextInputCommand::Copy(text))
+                }),
+            TextEditCommand::Cut => {
+                self.selected_text()
+                    .map_or_else(TextInputResult::handled, |text| {
+                        self.replace_selection("");
+                        TextInputResult::command(TextInputCommand::Cut(text))
+                    })
             }
-            (KeyCode::V, true, _) => TextInputResult::handled(),
-            (KeyCode::Z, true, false) => {
+            TextEditCommand::Paste => TextInputResult::command(TextInputCommand::PasteRequest),
+            TextEditCommand::Undo => {
                 self.undo();
                 TextInputResult::handled()
             }
-            (KeyCode::Z, true, true) => {
+            TextEditCommand::Redo => {
                 self.redo();
                 TextInputResult::handled()
             }
-            (KeyCode::Y, true, false) => {
-                self.redo();
-                TextInputResult::handled()
-            }
+        }
+    }
+
+    pub(crate) fn handle_key_with_layout(
+        &self,
+        event: KeyEvent,
+        text: &str,
+        font_size: f32,
+        max_width: f32,
+        wrap: TextWrap,
+        layout: &mut dyn TextLayoutEngine,
+    ) -> TextInputResult {
+        self.handle_key_internal(
+            event,
+            Some(TextNavigation {
+                text,
+                font_size,
+                max_width,
+                wrap,
+                layout,
+            }),
+        )
+    }
+
+    fn handle_key_internal(
+        &self,
+        event: KeyEvent,
+        mut navigation: Option<TextNavigation<'_>>,
+    ) -> TextInputResult {
+        let command = event.modifiers.command();
+        match (event.code, command, event.modifiers.shift) {
             (KeyCode::Backspace, _, _) => {
                 if command {
                     self.delete_word_backward();
@@ -439,17 +494,28 @@ impl TextFieldState {
                 TextInputResult::handled()
             }
             (KeyCode::Up, _, shift) => {
-                self.move_vertical(-1, shift);
+                self.move_vertical(-1, shift, navigation.as_mut());
                 TextInputResult::handled()
             }
             (KeyCode::Down, _, shift) => {
-                self.move_vertical(1, shift);
+                self.move_vertical(1, shift, navigation.as_mut());
                 TextInputResult::handled()
             }
             (KeyCode::Home, _, shift) => {
                 let value = self.value.get();
                 let cursor = if command {
                     0
+                } else if let Some(navigation) = navigation.as_mut() {
+                    navigation
+                        .layout
+                        .text_line_range(
+                            navigation.text,
+                            navigation.font_size,
+                            navigation.max_width,
+                            navigation.wrap,
+                            self.active_endpoint(),
+                        )
+                        .start
                 } else {
                     line_start(&value.text, value.selection.end)
                 };
@@ -460,6 +526,17 @@ impl TextFieldState {
                 let value = self.value.get();
                 let cursor = if command {
                     value.text.len()
+                } else if let Some(navigation) = navigation.as_mut() {
+                    navigation
+                        .layout
+                        .text_line_range(
+                            navigation.text,
+                            navigation.font_size,
+                            navigation.max_width,
+                            navigation.wrap,
+                            self.active_endpoint(),
+                        )
+                        .end
                 } else {
                     line_end(&value.text, value.selection.end)
                 };
@@ -496,6 +573,7 @@ impl TextFieldState {
             value.selection = start..start;
         }
         value.composition = Some(start..start);
+        *self.desired_x.borrow_mut() = None;
         self.value.set(value);
     }
 
@@ -512,6 +590,7 @@ impl TextFieldState {
         value.selection = end..end;
         value.composition = Some(start..end);
         *self.active.borrow_mut() = end;
+        *self.desired_x.borrow_mut() = None;
         self.value.set(value);
     }
 
@@ -598,6 +677,7 @@ impl TextFieldState {
         *self.composition_before.borrow_mut() = None;
         *self.anchor.borrow_mut() = None;
         *self.active.borrow_mut() = after.selection.end;
+        *self.desired_x.borrow_mut() = None;
     }
 
     fn finish_composition(&self) {
@@ -615,6 +695,7 @@ impl TextFieldState {
     }
 
     fn move_horizontal(&self, direction: isize, by_word: bool, extend: bool) {
+        *self.desired_x.borrow_mut() = None;
         let value = self.value.get();
         let cursor = if !extend && value.selection.start != value.selection.end {
             if direction < 0 {
@@ -655,7 +736,39 @@ impl TextFieldState {
         }
     }
 
-    fn move_vertical(&self, direction: isize, extend: bool) {
+    fn move_vertical(
+        &self,
+        direction: isize,
+        extend: bool,
+        navigation: Option<&mut TextNavigation<'_>>,
+    ) {
+        if let Some(navigation) = navigation {
+            let current = navigation.layout.caret_position(
+                navigation.text,
+                navigation.font_size,
+                navigation.max_width,
+                navigation.wrap,
+                self.active_endpoint(),
+            );
+            let desired_x = self
+                .desired_x
+                .borrow_mut()
+                .get_or_insert(current.position.x)
+                .to_owned();
+            let target = navigation.layout.hit_test_text(
+                navigation.text,
+                navigation.font_size,
+                navigation.max_width,
+                navigation.wrap,
+                Offset::new(
+                    desired_x,
+                    current.position.y + direction as f32 * current.height,
+                ),
+            );
+            self.move_to(target, extend);
+            *self.desired_x.borrow_mut() = Some(desired_x);
+            return;
+        }
         let value = self.value.get();
         let cursor = self.active_endpoint();
         let line_start = value.text[..cursor]

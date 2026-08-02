@@ -7,3 +7,4 @@ edition = "2024"
 karu = { path = "../karu" }
 karu-basic = { path = "../karu-basic" }
 karu-backend-quad = { path = "../karu-backend-quad", features = ["font-kit"] }
+karu-backend-wgpu = { path = "../karu-backend-wgpu" }
