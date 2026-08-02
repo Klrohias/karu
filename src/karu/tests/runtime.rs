@@ -1,16 +1,205 @@
 #[allow(unused_imports)]
 use karu::{
-    Animatable, App, AppBackend, AppConfig, Arrangement, BasicTextField, Color, Column,
-    ColumnOptions, Composition, CompositionLocal, Constraints, CrossAxisAlignment, ElementKind,
-    FocusRequester, FocusState, KeyCode, KeyEvent, KeyModifiers, LazyColumn, LazyColumnOptions,
-    Modifier, MutableState, Offset, PointerEvent, PointerKind, PointerPhase, RecomposeRequest,
-    RenderCommand, Row, RowOptions, ScrollEvent, ScrollState, TaskHandle, TaskRuntime, Text,
-    TextFieldOptions, TextFieldState, TextInputEvent, TextOptions, TweenSpec, composable,
-    composition_local_of, disposable_effect, key, mutable_state_of, provide,
-    remember_mutable_state, side_effect,
+    Animatable, App, AppBackend, AppConfig, Applier, Arrangement, BasicTextField, CaretPosition,
+    Color, Column, ColumnOptions, Composition, CompositionLocal, Constraints, CrossAxisAlignment,
+    Element, ElementApplier, ElementKind, FocusRequester, FocusState, HeadlessBackend,
+    HeadlessTextLayout, KeyCode, KeyEvent, KeyModifiers, LazyColumn, LazyColumnOptions, Modifier,
+    MutableState, Offset, PointerEvent, PointerKind, PointerPhase, RecomposeRequest, Recomposer,
+    Rect, RenderCommand, Row, RowOptions, ScrollEvent, ScrollState, Size, TaskHandle, TaskRuntime,
+    Text, TextFieldOptions, TextFieldState, TextInputEvent, TextLayoutEngine, TextOptions,
+    TextWrap, TweenSpec, composable, composition_local_of, disposable_effect, key,
+    mutable_state_of, provide, remember_mutable_state, side_effect,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
+
+#[test]
+fn text_layout_hits_measured_grapheme_intervals() {
+    let mut renderer = HeadlessTextLayout;
+
+    assert_eq!(
+        renderer.hit_test_text(
+            "a你b",
+            14.0,
+            f32::INFINITY,
+            TextWrap::NoWrap,
+            Offset::new(3.0, 4.0)
+        ),
+        0
+    );
+    assert_eq!(
+        renderer.hit_test_text(
+            "a你b",
+            14.0,
+            f32::INFINITY,
+            TextWrap::NoWrap,
+            Offset::new(12.0, 4.0)
+        ),
+        1
+    );
+    assert_eq!(
+        renderer.hit_test_text(
+            "a你b",
+            14.0,
+            f32::INFINITY,
+            TextWrap::NoWrap,
+            Offset::new(21.0, 4.0)
+        ),
+        4
+    );
+    assert_eq!(
+        renderer
+            .caret_position("a你b", 14.0, f32::INFINITY, TextWrap::NoWrap, 4)
+            .position
+            .x,
+        22.0
+    );
+}
+
+struct CountingTextLayout {
+    calls: Rc<std::cell::Cell<usize>>,
+    layout: HeadlessTextLayout,
+}
+
+impl TextLayoutEngine for CountingTextLayout {
+    fn measure_text(&mut self, text: &str, font_size: f32, max_width: f32, wrap: TextWrap) -> Size {
+        self.calls.set(self.calls.get() + 1);
+        self.layout.measure_text(text, font_size, max_width, wrap)
+    }
+    fn caret_position(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        max_width: f32,
+        wrap: TextWrap,
+        offset: usize,
+    ) -> CaretPosition {
+        self.calls.set(self.calls.get() + 1);
+        self.layout
+            .caret_position(text, font_size, max_width, wrap, offset)
+    }
+    fn hit_test_text(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        max_width: f32,
+        wrap: TextWrap,
+        position: Offset,
+    ) -> usize {
+        self.calls.set(self.calls.get() + 1);
+        self.layout
+            .hit_test_text(text, font_size, max_width, wrap, position)
+    }
+    fn text_line_range(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        max_width: f32,
+        wrap: TextWrap,
+        offset: usize,
+    ) -> std::ops::Range<usize> {
+        self.calls.set(self.calls.get() + 1);
+        self.layout
+            .text_line_range(text, font_size, max_width, wrap, offset)
+    }
+    fn selection_rects(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        max_width: f32,
+        wrap: TextWrap,
+        range: std::ops::Range<usize>,
+    ) -> Vec<Rect> {
+        self.calls.set(self.calls.get() + 1);
+        self.layout
+            .selection_rects(text, font_size, max_width, wrap, range)
+    }
+}
+
+#[composable]
+fn SharedRendererContent() {
+    Text("measured", TextOptions::default());
+}
+
+#[test]
+fn composition_uses_renderer_text_queries_for_layout_and_commands() {
+    let calls = Rc::new(std::cell::Cell::new(0));
+    let mut composition = Composition::new(SharedRendererContent);
+    let mut layout = CountingTextLayout {
+        calls: calls.clone(),
+        layout: HeadlessTextLayout,
+    };
+    let mut backend = HeadlessBackend;
+    composition.render_with(&mut layout, &mut backend).unwrap();
+    let result = composition
+        .last_result()
+        .expect("composition result exists");
+    let command = only_text_command(&result.commands);
+    let RenderCommand::DrawText { node: node_id, .. } = command else {
+        unreachable!()
+    };
+    let node = result
+        .render_tree
+        .root
+        .find(*node_id)
+        .expect("text node exists");
+
+    assert!(calls.get() >= 2);
+    assert!(node.text_field.is_none());
+}
+
+#[test]
+fn public_ui_functions_build_nodes_without_macro_rewriting() {
+    let mut composition = Composition::new(|| {
+        Column(ColumnOptions::default(), || {
+            Text("public", TextOptions::default());
+        });
+    });
+
+    let result = composition.compose();
+    assert!(matches!(result.root.children[0].kind, ElementKind::Column));
+    assert!(matches!(
+        result.root.children[0].children[0].kind,
+        ElementKind::Text(ref value) if value == "public"
+    ));
+}
+
+#[test]
+fn element_applier_owns_tree_mutation() {
+    let mut applier = ElementApplier::new(Element::new(
+        karu::NodeId(0),
+        ElementKind::Root,
+        Modifier::empty(),
+    ));
+    applier.begin_node(Element::new(
+        karu::NodeId(1),
+        ElementKind::Text("child".to_string()),
+        Modifier::empty(),
+    ));
+    applier.end_node();
+
+    let root = applier.finish().expect("balanced applier");
+    assert_eq!(root.children.len(), 1);
+    assert_eq!(root.children[0].id, karu::NodeId(1));
+}
+
+#[test]
+fn recomposer_only_runs_dirty_compositions() {
+    let mut composition = Composition::new(|| Text("frame", TextOptions::default()));
+    let mut recomposer = Recomposer::new();
+    let mut layout = HeadlessTextLayout;
+
+    assert!(
+        recomposer
+            .recompose_with(&mut composition, &mut layout)
+            .is_some()
+    );
+    assert!(
+        recomposer
+            .recompose_with(&mut composition, &mut layout)
+            .is_none()
+    );
+}
 
 #[composable]
 fn CounterApp(state_out: Rc<RefCell<Option<MutableState<i32>>>>) {
@@ -883,7 +1072,7 @@ fn text_input_prefers_the_active_field_over_pointer_position() {
         })
     );
 
-    assert_eq!(first.text(), "one!");
+    assert_eq!(first.text(), "!one");
     assert_eq!(second.text(), "two");
 }
 

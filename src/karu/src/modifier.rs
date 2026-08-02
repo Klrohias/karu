@@ -806,39 +806,44 @@ impl ModifierElement for TextInput {
         let state = self.state.clone();
         events.register_text_pointer_handler(node, {
             let state = state.clone();
-            move |event| {
-                let layout = event.layout.as_ref();
+            move |event, renderer| {
                 if matches!(
                     event.event.phase,
                     crate::PointerPhase::Down | crate::PointerPhase::Move
                 ) {
                     if event.event.phase == crate::PointerPhase::Move {
-                        if let Some(layout) = layout {
-                            state.extend_selection_from_position(event.local_position, layout);
-                        } else {
-                            state.extend_selection_from_x(event.local_position.x, event.font_size);
-                        }
-                    } else if event.was_focused {
-                        if let Some(layout) = layout {
-                            state.set_cursor_from_position(event.local_position, layout);
-                            state.begin_selection_from_position(event.local_position, layout);
-                        } else {
-                            state.set_cursor_from_x(event.local_position.x, event.font_size);
-                            state.begin_selection_from_x(event.local_position.x, event.font_size);
-                        }
+                        state.extend_selection_from_position(
+                            event.local_position,
+                            &event.context.text,
+                            event.context.font_size,
+                            event.context.max_width,
+                            event.context.wrap,
+                            renderer,
+                        );
                     } else {
-                        if let Some(layout) = layout {
-                            state.begin_selection_from_position(event.local_position, layout);
-                        } else {
-                            state.begin_selection_from_x(event.local_position.x, event.font_size);
-                        }
+                        state.set_cursor_from_position(
+                            event.local_position,
+                            &event.context.text,
+                            event.context.font_size,
+                            event.context.max_width,
+                            event.context.wrap,
+                            renderer,
+                        );
+                        state.begin_selection_from_position(
+                            event.local_position,
+                            &event.context.text,
+                            event.context.font_size,
+                            event.context.max_width,
+                            event.context.wrap,
+                            renderer,
+                        );
                     }
                 } else if event.event.phase == crate::PointerPhase::Up {
                     state.clear_selection_anchor();
                 }
             }
         });
-        events.register_text_input_handler(node, move |event| match event {
+        events.register_text_input_handler(node, move |event, context, renderer| match event {
             TextInputEvent::Insert { text, .. } | TextInputEvent::Paste { text, .. } => {
                 state.replace_selection(text);
                 TextInputResult::handled()
@@ -847,7 +852,14 @@ impl ModifierElement for TextInput {
                 state.backspace();
                 TextInputResult::handled()
             }
-            TextInputEvent::Key { event, .. } => state.handle_key(event),
+            TextInputEvent::Key { event, .. } => state.handle_key_with_layout(
+                event,
+                &context.text,
+                context.font_size,
+                context.max_width,
+                context.wrap,
+                renderer,
+            ),
             TextInputEvent::CompositionStart { .. } => {
                 state.start_composition();
                 TextInputResult::handled()

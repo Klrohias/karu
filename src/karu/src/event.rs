@@ -1,6 +1,7 @@
 use crate::element::NodeId;
 use crate::layout::{LayoutNode, Offset};
-use crate::renderer::TextInputResult;
+use crate::renderer::{TextInputResult, TextLayoutEngine};
+use crate::text_layout::TextWrap;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
@@ -96,19 +97,30 @@ pub struct InteractionState {
 }
 
 type PointerCallback = Rc<RefCell<dyn FnMut(PointerEvent)>>;
-type TextPointerCallback = Rc<RefCell<dyn FnMut(TextPointerEvent)>>;
+type TextPointerCallback = Rc<RefCell<dyn FnMut(TextPointerEvent, &mut dyn TextLayoutEngine)>>;
 type ClickCallback = Rc<RefCell<dyn FnMut()>>;
 type ScrollCallback = Rc<RefCell<dyn FnMut(ScrollEvent) -> bool>>;
-type TextInputCallback = Rc<RefCell<dyn FnMut(TextInputEvent) -> TextInputResult>>;
+type TextInputCallback = Rc<
+    RefCell<
+        dyn FnMut(TextInputEvent, TextInputContext, &mut dyn TextLayoutEngine) -> TextInputResult,
+    >,
+>;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextInputContext {
+    pub text: String,
+    pub font_size: f32,
+    pub max_width: f32,
+    pub wrap: TextWrap,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextPointerEvent {
     pub event: PointerEvent,
     pub local_position: Offset,
     pub bounds: crate::Rect,
-    pub font_size: f32,
     pub was_focused: bool,
-    pub layout: Option<crate::TextLayout>,
+    pub context: TextInputContext,
     pub scroll_offset: Offset,
 }
 
@@ -185,7 +197,7 @@ impl EventRegistry {
     pub(crate) fn register_text_pointer_handler(
         &mut self,
         node: NodeId,
-        handler: impl FnMut(TextPointerEvent) + 'static,
+        handler: impl FnMut(TextPointerEvent, &mut dyn TextLayoutEngine) + 'static,
     ) {
         self.text_pointer_handlers
             .entry(node)
@@ -207,7 +219,12 @@ impl EventRegistry {
     pub(crate) fn register_text_input_handler(
         &mut self,
         node: NodeId,
-        handler: impl FnMut(TextInputEvent) -> TextInputResult + 'static,
+        handler: impl FnMut(
+            TextInputEvent,
+            TextInputContext,
+            &mut dyn TextLayoutEngine,
+        ) -> TextInputResult
+        + 'static,
     ) {
         self.text_input_handlers
             .entry(node)
@@ -221,7 +238,12 @@ impl EventRegistry {
         interaction
     }
 
-    pub(crate) fn dispatch(&mut self, tree: &LayoutNode, event: PointerEvent) -> bool {
+    pub(crate) fn dispatch(
+        &mut self,
+        tree: &LayoutNode,
+        event: PointerEvent,
+        layout: &mut dyn TextLayoutEngine,
+    ) -> bool {
         let pointer = PointerId::from(event.kind);
         let hit = hit_test(tree, event.position);
         let previous = self.pointers.get(&pointer).copied();
@@ -242,7 +264,7 @@ impl EventRegistry {
                     );
                     if let Some(node) = hit {
                         self.set_pressed(node, true);
-                        self.invoke_text_pointer_handler(tree, node, event, was_focused);
+                        self.invoke_text_pointer_handler(tree, node, event, was_focused, layout);
                     }
                 }
                 handled |= self.invoke_pointer_handlers(hit, event);
@@ -255,7 +277,8 @@ impl EventRegistry {
                 record.hovered = hit;
                 if let Some(node) = record.target {
                     self.set_pressed(node, hit == Some(node));
-                    self.invoke_text_pointer_handler(tree, node, event, true);
+                    self.invoke_text_pointer_handler(tree, node, event, true, layout);
+                    handled = true;
                 }
                 handled |= self.invoke_pointer_handlers(hit, event);
             }
@@ -265,7 +288,8 @@ impl EventRegistry {
                     && let Some(node) = record.target
                 {
                     self.set_pressed(node, false);
-                    self.invoke_text_pointer_handler(tree, node, event, true);
+                    self.invoke_text_pointer_handler(tree, node, event, true, layout);
+                    handled = true;
                     if event.primary
                         && hit == Some(node)
                         && let Some(handlers) = self.click_handlers.get(&node)
@@ -314,13 +338,21 @@ impl EventRegistry {
         &mut self,
         tree: &LayoutNode,
         event: TextInputEvent,
+        layout: &mut dyn TextLayoutEngine,
     ) -> TextInputResult {
         if let Some(node) = self.active_text_input
             && let Some(handlers) = self.text_input_handlers.get(&node)
         {
+            let Some(context) = text_context(tree, node) else {
+                return TextInputResult::default();
+            };
             let mut result = TextInputResult::default();
             for handler in handlers {
-                result.merge((handler.borrow_mut())(event.clone()));
+                result.merge((handler.borrow_mut())(
+                    event.clone(),
+                    context.clone(),
+                    layout,
+                ));
             }
             result.handled = true;
             return result;
@@ -344,8 +376,15 @@ impl EventRegistry {
             return TextInputResult::default();
         };
         let mut result = TextInputResult::default();
+        let Some(context) = text_context(tree, node) else {
+            return TextInputResult::default();
+        };
         for handler in handlers {
-            result.merge((handler.borrow_mut())(event.clone()));
+            result.merge((handler.borrow_mut())(
+                event.clone(),
+                context.clone(),
+                layout,
+            ));
         }
         result.handled = true;
         result
@@ -357,27 +396,30 @@ impl EventRegistry {
         node: NodeId,
         event: PointerEvent,
         was_focused: bool,
+        layout: &mut dyn TextLayoutEngine,
     ) {
         let Some(handlers) = self.text_pointer_handlers.get(&node) else {
             return;
         };
-        let Some(layout) = tree.find(node) else {
+        let Some(node_layout) = tree.find(node) else {
+            return;
+        };
+        let Some(context) = text_context(tree, node) else {
             return;
         };
         let text_event = TextPointerEvent {
             event,
             local_position: Offset::new(
-                event.position.x - layout.bounds.origin.x,
-                event.position.y - layout.bounds.origin.y,
+                event.position.x - node_layout.text_origin.x + node_layout.text_scroll.x,
+                event.position.y - node_layout.text_origin.y + node_layout.text_scroll.y,
             ),
-            bounds: layout.bounds,
-            font_size: layout.font_size.unwrap_or(14.0),
+            bounds: node_layout.bounds,
             was_focused,
-            layout: layout.text_layout.clone(),
-            scroll_offset: layout.text_scroll,
+            context,
+            scroll_offset: node_layout.text_scroll,
         };
         for handler in handlers {
-            (handler.borrow_mut())(text_event.clone());
+            (handler.borrow_mut())(text_event.clone(), layout);
         }
     }
 
@@ -410,6 +452,20 @@ impl EventRegistry {
             }
         }
     }
+}
+
+fn text_context(tree: &LayoutNode, node: NodeId) -> Option<TextInputContext> {
+    let node_data = tree.find(node)?;
+    let text = match &node_data.kind {
+        crate::ElementKind::Text(text) => text.clone(),
+        _ => return None,
+    };
+    Some(TextInputContext {
+        text,
+        font_size: node_data.font_size.unwrap_or(14.0),
+        max_width: node_data.text_viewport.size.width,
+        wrap: node_data.text_wrap,
+    })
 }
 
 fn hit_test(node: &LayoutNode, position: Offset) -> Option<NodeId> {

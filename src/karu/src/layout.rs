@@ -5,7 +5,8 @@ use crate::modifier::{
     Alignment, Arrangement, BorderData, Brush, Color, CrossAxisAlignment, ModifierData, ScrollAxis,
     Semantics,
 };
-use crate::text_layout::{BasicTextLayoutEngine, TextLayout, TextLayoutEngine, TextWrap};
+use crate::renderer::TextLayoutEngine;
+use crate::text_layout::TextWrap;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Dp(pub f32);
@@ -136,7 +137,8 @@ pub struct LayoutNode {
     pub text_field: Option<TextFieldValue>,
     pub text_focused: bool,
     pub text_cursor: usize,
-    pub text_layout: Option<TextLayout>,
+    pub text_origin: Offset,
+    pub text_viewport: Rect,
     pub text_wrap: TextWrap,
     pub text_scroll: Offset,
     pub children: Vec<LayoutNode>,
@@ -172,19 +174,29 @@ impl LayoutNode {
 
 #[allow(dead_code)]
 pub fn layout_tree(element: &Element, constraints: Constraints) -> LayoutNode {
-    layout_element(element, Offset::ZERO, constraints, &|_| {
-        InteractionState::default()
-    })
+    let mut layout = crate::HeadlessTextLayout;
+    layout_element(
+        element,
+        Offset::ZERO,
+        constraints,
+        &|_| InteractionState::default(),
+        &mut layout,
+    )
 }
 
 pub(crate) fn layout_tree_with_events(
     element: &Element,
     constraints: Constraints,
     events: &EventRegistry,
+    layout: &mut dyn TextLayoutEngine,
 ) -> LayoutNode {
-    layout_element(element, Offset::ZERO, constraints, &|node| {
-        events.interaction(node)
-    })
+    layout_element(
+        element,
+        Offset::ZERO,
+        constraints,
+        &|node| events.interaction(node),
+        layout,
+    )
 }
 
 fn layout_element(
@@ -192,6 +204,7 @@ fn layout_element(
     origin: Offset,
     constraints: Constraints,
     interactions: &dyn Fn(NodeId) -> InteractionState,
+    layout: &mut dyn TextLayoutEngine,
 ) -> LayoutNode {
     let interaction = interactions(element.id);
     let data = element.modifier.data_for(interaction);
@@ -240,6 +253,7 @@ fn layout_element(
                 content_constraints,
                 interactions,
                 data.vertical_arrangement,
+                layout,
             )
         }
         ElementKind::Row => layout_horizontal_children(
@@ -248,50 +262,64 @@ fn layout_element(
             content_constraints,
             interactions,
             data.horizontal_arrangement,
+            layout,
         ),
         ElementKind::Box => layout_stack_children(
             &element.children,
             child_origin,
             content_constraints,
             interactions,
+            layout,
         ),
         ElementKind::Text(_) | ElementKind::Custom(_) => Vec::new(),
     };
 
-    let content_size = intrinsic_size(element, &children, child_constraints);
+    let content_size = intrinsic_size(element, &children, child_constraints, layout);
     let size = apply_modifier_size(&data, content_size, constraints);
 
-    let text_layout = match &element.kind {
+    let text_size = match &element.kind {
         ElementKind::Text(text) => {
             let max_width = (size.width - data.padding.horizontal()).max(0.0);
-            let mut layout = BasicTextLayoutEngine.layout(
+            let mut text_size = layout.measure_text(
                 text,
                 data.font_size.unwrap_or(14.0),
                 max_width,
                 data.text_wrap,
             );
             if let Some(min_lines) = data.text_min_lines {
-                let lines = min_lines.max(layout.lines.len());
-                layout.size.height = lines as f32 * layout.line_height;
+                let line_height = data.font_size.unwrap_or(14.0) * (20.0 / 14.0);
+                text_size.height = text_size.height.max(min_lines as f32 * line_height);
             }
             if let Some(max_lines) = data.text_max_lines {
-                layout.size.height = layout
-                    .size
-                    .height
-                    .min(max_lines as f32 * layout.line_height);
+                let line_height = data.font_size.unwrap_or(14.0) * (20.0 / 14.0);
+                text_size.height = text_size.height.min(max_lines as f32 * line_height);
             }
-            Some(layout)
+            Some(text_size)
         }
         _ => None,
     };
-    let text_scroll = if let (Some(layout), Some(state)) =
-        (text_layout.as_ref(), element.modifier.text_field_state())
-    {
-        state.ensure_cursor_visible(layout, size);
-        state.scroll_offset()
-    } else {
-        Offset::ZERO
-    };
+    let text_scroll =
+        if let (Some(text_size), Some(state)) = (text_size, element.modifier.text_field_state()) {
+            let text = match &element.kind {
+                ElementKind::Text(text) => text,
+                _ => unreachable!(),
+            };
+            state.ensure_cursor_visible(
+                text,
+                data.font_size.unwrap_or(14.0),
+                (size.width - data.padding.horizontal()).max(0.0),
+                data.text_wrap,
+                text_size,
+                Size::new(
+                    (size.width - data.padding.horizontal()).max(0.0),
+                    (size.height - data.padding.vertical()).max(0.0),
+                ),
+                layout,
+            );
+            state.scroll_offset()
+        } else {
+            Offset::ZERO
+        };
 
     match element.kind {
         ElementKind::Column => align_column_children(
@@ -347,6 +375,7 @@ fn layout_element(
                     },
                     interactions,
                     data.horizontal_arrangement,
+                    layout,
                 ),
                 _ => layout_vertical_children(
                     &element.children,
@@ -357,6 +386,7 @@ fn layout_element(
                     },
                     interactions,
                     data.vertical_arrangement,
+                    layout,
                 ),
             };
         }
@@ -365,10 +395,19 @@ fn layout_element(
     if matches!(element.kind, ElementKind::Box) {
         for child in &mut children {
             let alignment = child_alignment(element, child, data.alignment.unwrap_or_default());
-            child.bounds.origin =
-                aligned_origin(child.bounds, origin, size, data.padding, alignment);
+            let next = aligned_origin(child.bounds, origin, size, data.padding, alignment);
+            let previous = child.bounds.origin;
+            translate_node(child, next.x - previous.x, next.y - previous.y);
         }
     }
+
+    let text_origin = Offset::new(origin.x + data.padding.left, origin.y + data.padding.top);
+    let text_viewport = Rect::new(
+        text_origin.x,
+        text_origin.y,
+        (size.width - data.padding.horizontal()).max(0.0),
+        (size.height - data.padding.vertical()).max(0.0),
+    );
 
     LayoutNode {
         id: element.id,
@@ -393,7 +432,8 @@ fn layout_element(
             .text_field_state()
             .map(|state| state.active_endpoint())
             .unwrap_or(0),
-        text_layout,
+        text_origin,
+        text_viewport,
         text_wrap: data.text_wrap,
         text_scroll,
         children,
@@ -406,6 +446,7 @@ fn layout_vertical_children(
     constraints: Constraints,
     interactions: &dyn Fn(NodeId) -> InteractionState,
     arrangement: Arrangement,
+    layout: &mut dyn TextLayoutEngine,
 ) -> Vec<LayoutNode> {
     layout_weighted_children(
         children,
@@ -414,6 +455,7 @@ fn layout_vertical_children(
         interactions,
         arrangement,
         Axis::Vertical,
+        layout,
     )
 }
 
@@ -423,6 +465,7 @@ fn layout_horizontal_children(
     constraints: Constraints,
     interactions: &dyn Fn(NodeId) -> InteractionState,
     arrangement: Arrangement,
+    layout: &mut dyn TextLayoutEngine,
 ) -> Vec<LayoutNode> {
     layout_weighted_children(
         children,
@@ -431,6 +474,7 @@ fn layout_horizontal_children(
         interactions,
         arrangement,
         Axis::Horizontal,
+        layout,
     )
 }
 
@@ -447,6 +491,7 @@ fn layout_weighted_children(
     interactions: &dyn Fn(NodeId) -> InteractionState,
     arrangement: Arrangement,
     axis: Axis,
+    layout: &mut dyn TextLayoutEngine,
 ) -> Vec<LayoutNode> {
     let weights = children
         .iter()
@@ -463,7 +508,7 @@ fn layout_weighted_children(
         .map(|(child, weight)| {
             weight
                 .is_none()
-                .then(|| layout_element(child, origin, constraints, interactions))
+                .then(|| layout_element(child, origin, constraints, interactions, layout))
         })
         .collect::<Vec<_>>();
     let occupied = nodes
@@ -504,6 +549,7 @@ fn layout_weighted_children(
             origin,
             child_constraints,
             interactions,
+            layout,
         ));
     }
     let mut nodes = nodes.into_iter().map(Option::unwrap).collect::<Vec<_>>();
@@ -559,6 +605,10 @@ fn place_arranged_children(
 fn translate_node(node: &mut LayoutNode, dx: f32, dy: f32) {
     node.bounds.origin.x += dx;
     node.bounds.origin.y += dy;
+    node.text_origin.x += dx;
+    node.text_origin.y += dy;
+    node.text_viewport.origin.x += dx;
+    node.text_viewport.origin.y += dy;
     for child in &mut node.children {
         translate_node(child, dx, dy);
     }
@@ -607,18 +657,24 @@ fn layout_stack_children(
     origin: Offset,
     constraints: Constraints,
     interactions: &dyn Fn(NodeId) -> InteractionState,
+    layout: &mut dyn TextLayoutEngine,
 ) -> Vec<LayoutNode> {
     children
         .iter()
-        .map(|child| layout_element(child, origin, constraints, interactions))
+        .map(|child| layout_element(child, origin, constraints, interactions, layout))
         .collect()
 }
 
-fn intrinsic_size(element: &Element, children: &[LayoutNode], constraints: Constraints) -> Size {
+fn intrinsic_size(
+    element: &Element,
+    children: &[LayoutNode],
+    constraints: Constraints,
+    layout: &mut dyn TextLayoutEngine,
+) -> Size {
     match &element.kind {
         ElementKind::Text(text) => {
             let data = element.modifier.data();
-            let mut size = BasicTextLayoutEngine.measure(
+            let mut size = layout.measure_text(
                 text,
                 data.font_size.unwrap_or(14.0),
                 constraints.max_width,

@@ -203,32 +203,27 @@ impl BoxOptions {
 
 #[allow(non_snake_case)]
 pub fn Column(options: ColumnOptions, children: impl FnOnce()) {
-    let _ = options;
-    children();
+    __karu_Column(options, children);
 }
 
 #[allow(non_snake_case)]
 pub fn Row(options: RowOptions, children: impl FnOnce()) {
-    let _ = options;
-    children();
+    __karu_Row(options, children);
 }
 
 #[allow(non_snake_case)]
 pub fn Box(options: BoxOptions, children: impl FnOnce()) {
-    let _ = options;
-    children();
+    __karu_Box(options, children);
 }
 
 #[allow(non_snake_case)]
 pub fn Text(text: impl Into<String>, options: TextOptions) {
-    let _ = text.into();
-    let _ = options;
+    __karu_Text(text, options);
 }
 
 #[allow(non_snake_case)]
 pub fn BasicTextField(state: &TextFieldState, options: TextFieldOptions) {
-    let _ = state;
-    let _ = options;
+    __karu_BasicTextField(state, options);
 }
 
 pub struct LazyColumnScope;
@@ -252,13 +247,12 @@ impl LazyColumnScope {
 
 #[allow(non_snake_case)]
 pub fn LazyColumn(options: LazyColumnOptions, content: impl FnOnce(&mut LazyColumnScope)) {
-    let _ = options;
-    let _ = content;
+    __karu_LazyColumn(options, content);
 }
 
 #[allow(non_snake_case)]
 pub fn Spacer(options: SpacerOptions) {
-    let _ = options;
+    __karu_Spacer(options);
 }
 
 #[doc(hidden)]
