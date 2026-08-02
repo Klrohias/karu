@@ -11,6 +11,7 @@ use std::convert::Infallible;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
@@ -35,11 +36,16 @@ impl Wgpu {
     pub fn system_font(self, family: impl Into<String>) -> ConfiguredWgpu {
         ConfiguredWgpu::default().system_font(family)
     }
+
+    pub fn enable_debug_info(self) -> ConfiguredWgpu {
+        ConfiguredWgpu::default().enable_debug_info()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct ConfiguredWgpu {
     font: Option<FontConfig>,
+    debug_info: bool,
 }
 
 impl ConfiguredWgpu {
@@ -50,6 +56,11 @@ impl ConfiguredWgpu {
 
     pub fn system_font(mut self, family: impl Into<String>) -> Self {
         self.font = Some(FontConfig::SystemFamily(family.into()));
+        self
+    }
+
+    pub fn enable_debug_info(mut self) -> Self {
+        self.debug_info = true;
         self
     }
 
@@ -76,7 +87,7 @@ impl AppBackend for Wgpu {
 impl AppBackend for ConfiguredWgpu {
     fn run(self, root: AppRoot, config: AppConfig) {
         let event_loop = EventLoop::new().expect("failed to create winit event loop");
-        let mut app = WgpuApp::new(root, config, self.font_family());
+        let mut app = WgpuApp::new(root, config, self.font_family(), self.debug_info);
         event_loop
             .run_app(&mut app)
             .expect("winit event loop failed");
@@ -87,6 +98,7 @@ struct WgpuApp {
     root: Option<AppRoot>,
     config: AppConfig,
     family: Option<String>,
+    debug_info: bool,
     window: Option<Arc<Window>>,
     runtime: Option<WgpuRuntime>,
     cursor: Offset,
@@ -94,11 +106,12 @@ struct WgpuApp {
 }
 
 impl WgpuApp {
-    fn new(root: AppRoot, config: AppConfig, family: Option<String>) -> Self {
+    fn new(root: AppRoot, config: AppConfig, family: Option<String>, debug_info: bool) -> Self {
         Self {
             root: Some(root),
             config,
             family,
+            debug_info,
             window: None,
             runtime: None,
             cursor: Offset::ZERO,
@@ -224,6 +237,7 @@ impl ApplicationHandler for WgpuApp {
             window.clone(),
             self.config.background,
             self.family.clone(),
+            self.debug_info,
         ));
         let context = renderer.text_context();
         let mut text_layout = CosmicTextLayout::with_context(context, self.family.clone());
@@ -508,6 +522,34 @@ pub struct WgpuBackend {
     text_context: Rc<RefCell<FontSystem>>,
     text_rasterizer: TextRasterizer,
     clipboard: WgpuClipboard,
+    debug_info: bool,
+    frame_stats: FrameStats,
+}
+
+struct FrameStats {
+    sample_started: Instant,
+    frames: u32,
+    fps: f32,
+}
+
+impl FrameStats {
+    fn new() -> Self {
+        Self {
+            sample_started: Instant::now(),
+            frames: 0,
+            fps: 0.0,
+        }
+    }
+
+    fn tick(&mut self) {
+        self.frames = self.frames.saturating_add(1);
+        let elapsed = self.sample_started.elapsed();
+        if elapsed >= Duration::from_millis(250) {
+            self.fps = self.frames as f32 / elapsed.as_secs_f32().max(f32::EPSILON);
+            self.frames = 0;
+            self.sample_started = Instant::now();
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -533,7 +575,12 @@ impl karu::Clipboard for WgpuClipboard {
 }
 
 impl WgpuBackend {
-    pub async fn new(window: Arc<Window>, background: Color, family: Option<String>) -> Self {
+    pub async fn new(
+        window: Arc<Window>,
+        background: Color,
+        family: Option<String>,
+        debug_info: bool,
+    ) -> Self {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = instance
             .create_surface(window.clone())
@@ -700,6 +747,8 @@ impl WgpuBackend {
             text_context,
             text_rasterizer,
             clipboard: WgpuClipboard,
+            debug_info,
+            frame_stats: FrameStats::new(),
         }
     }
 
@@ -744,6 +793,9 @@ impl WgpuBackend {
             | wgpu::CurrentSurfaceTexture::Lost
             | wgpu::CurrentSurfaceTexture::Validation => return,
         };
+        if self.debug_info {
+            self.frame_stats.tick();
+        }
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -769,6 +821,17 @@ impl WgpuBackend {
                 Some((buffer, vertex_count))
             })
             .collect::<Vec<_>>();
+        let debug_info_buffer = self.debug_info.then(|| {
+            let vertices = rect_vertices(
+                Rect::new(8.0, 8.0, 86.0, 28.0),
+                Color::rgba(0.04, 0.06, 0.10, 0.88),
+            );
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("karu-wgpu-debug-info-background"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
+        });
         let queue = &self.queue;
         let shape_pipeline = &self.shape_pipeline;
         let screen_bind_group = &self.screen_bind_group;
@@ -858,6 +921,25 @@ impl WgpuBackend {
                 }
                 RenderCommand::DrawImage { .. } => {}
             }
+        }
+        if self.debug_info {
+            pass.set_scissor_rect(0, 0, surface_width, surface_height);
+            draw_debug_info(
+                &mut pass,
+                device,
+                queue,
+                shape_pipeline,
+                text_pipeline,
+                screen_bind_group,
+                text_bind_group_layout,
+                sampler,
+                text_rasterizer,
+                debug_info_buffer
+                    .as_ref()
+                    .expect("debug info buffer exists"),
+                self.frame_stats.fps,
+                scale,
+            );
         }
         drop(pass);
         queue.submit(Some(encoder.finish()));
@@ -1017,6 +1099,49 @@ fn draw_shape<'a>(
     pass.set_bind_group(0, screen_bind_group, &[]);
     pass.set_vertex_buffer(0, shape_buffer.slice(..));
     pass.draw(0..vertex_count, 0..1);
+}
+
+fn draw_debug_info<'a>(
+    pass: &mut wgpu::RenderPass<'a>,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    shape_pipeline: &wgpu::RenderPipeline,
+    text_pipeline: &wgpu::RenderPipeline,
+    screen_bind_group: &wgpu::BindGroup,
+    text_bind_group_layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    text_rasterizer: &mut TextRasterizer,
+    background_buffer: &'a wgpu::Buffer,
+    fps: f32,
+    scale_factor: f32,
+) {
+    let rect = Rect::new(8.0, 8.0, 86.0, 28.0);
+    draw_shape(
+        pass,
+        background_buffer,
+        6,
+        shape_pipeline,
+        screen_bind_group,
+    );
+
+    let label = format!("FPS {:.0}", fps);
+    draw_text(
+        pass,
+        device,
+        queue,
+        text_pipeline,
+        screen_bind_group,
+        text_bind_group_layout,
+        sampler,
+        text_rasterizer,
+        rect,
+        &label,
+        13.0,
+        Color::WHITE,
+        TextWrap::NoWrap,
+        Offset::new(16.0, 14.0),
+        scale_factor,
+    );
 }
 
 fn shape_vertices(command: &RenderCommand) -> Option<Vec<ShapeVertex>> {
@@ -1773,6 +1898,13 @@ fn paragraph_starts(text: &str) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_info_is_opt_in() {
+        assert!(!ConfiguredWgpu::default().debug_info);
+        assert!(Wgpu.default_system_font().enable_debug_info().debug_info);
+        assert!(Wgpu.enable_debug_info().debug_info);
+    }
 
     #[test]
     fn gradient_clamps_and_interpolates() {

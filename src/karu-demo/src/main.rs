@@ -591,7 +591,7 @@ fn TodoApp() {
 
 fn main() {
     App::builder()
-        .with_renderer(Wgpu.default_system_font())
+        .with_renderer(Wgpu.default_system_font().enable_debug_info())
         .title("Karu Todo")
         .size(1100, 720)
         .background(BACKGROUND)
