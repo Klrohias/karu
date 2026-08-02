@@ -14,7 +14,6 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::pin::Pin;
 use std::ptr;
 use std::rc::Rc;
-use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CompositionId(pub usize);
@@ -574,57 +573,30 @@ impl Composition {
         if force_full {
             self.composer.inner.borrow().invalidation.mark_dirty();
         }
-        let started = Instant::now();
         self.composer.begin_composition();
 
         // Set thread-local composer pointer for the duration of root execution
         let composer_ptr: *mut Composer = &mut self.composer;
         let _composer_guard = CurrentComposerGuard::install(composer_ptr);
-        let root_started = Instant::now();
         (self.root)();
         drop(_composer_guard);
-        let root_elapsed = root_started.elapsed();
 
-        let finish_started = Instant::now();
         let root = self
             .composer
             .finish_composition()
             .expect("karu composition ended with an unbalanced node stack");
-        let finish_elapsed = finish_started.elapsed();
 
-        let effects_started = Instant::now();
         for effect in self.composer.take_side_effects() {
             effect();
         }
-        let effects_elapsed = effects_started.elapsed();
 
-        let layout_started = Instant::now();
         let layout_root = {
             let inner = self.composer.inner.borrow();
             layout_tree_with_events(&root, self.constraints, &inner.events, layout)
         };
-        let layout_elapsed = layout_started.elapsed();
         let render_tree = RenderTree { root: layout_root };
 
-        let commands_started = Instant::now();
         let commands = crate::renderer::commands_for_tree_with_layout(&render_tree.root, layout);
-        let commands_elapsed = commands_started.elapsed();
-        let (scope_hits, scope_misses) = {
-            let inner = self.composer.inner.borrow();
-            (inner.scope_cache_hits, inner.scope_cache_misses)
-        };
-        println!(
-            "[karu][compose] total={:?} root={:?} finish={:?} effects={:?} layout={:?} commands={:?} render_commands={} scope_hits={} scope_misses={}",
-            started.elapsed(),
-            root_elapsed,
-            finish_elapsed,
-            effects_elapsed,
-            layout_elapsed,
-            commands_elapsed,
-            commands.len(),
-            scope_hits,
-            scope_misses,
-        );
         let result = CompositionResult {
             root,
             render_tree,
@@ -858,8 +830,6 @@ pub(crate) struct ComposerInner {
     dirty_scopes: HashSet<RecomposeScopeId>,
     force_full_recompose: bool,
     dirty_component_stack: Vec<bool>,
-    scope_cache_hits: usize,
-    scope_cache_misses: usize,
     task_runtime: Option<Rc<dyn TaskRuntime>>,
     invalidation: Rc<InvalidationState>,
     events: EventRegistry,
@@ -887,8 +857,6 @@ impl ComposerInner {
             dirty_scopes: HashSet::new(),
             force_full_recompose: false,
             dirty_component_stack: Vec::new(),
-            scope_cache_hits: 0,
-            scope_cache_misses: 0,
             task_runtime: None,
             invalidation,
             events: EventRegistry::default(),
@@ -905,8 +873,6 @@ impl ComposerInner {
         self.used_launched_effects.clear();
         self.pending_launched_effects.clear();
         self.dirty_component_stack.clear();
-        self.scope_cache_hits = 0;
-        self.scope_cache_misses = 0;
         (self.force_full_recompose, self.dirty_scopes) = self.invalidation.take_dirty();
         self.events.begin_composition();
         let root_id = self.node_id_for(&[]);
@@ -1015,7 +981,6 @@ impl ComposerInner {
             .any(|dirty| dirty.0.len() > scope.0.len() && dirty.0.starts_with(&scope.0));
         let dirty = self.force_full_recompose || inherited_dirty || exact_dirty || descendant_dirty;
         if !dirty && let Some(entry) = self.component_cache.get(&scope).cloned() {
-            self.scope_cache_hits += 1;
             self.use_component_cache(&entry);
             self.restore_events(&entry.element);
             self.applier.append_node(entry.element);
@@ -1023,7 +988,6 @@ impl ComposerInner {
         }
 
         let id = self.node_id_for(&path);
-        self.scope_cache_misses += 1;
         let modifier = Modifier::empty();
         modifier.install_events(id, &mut self.events);
         self.frames.push(Frame { path, next_slot: 0 });

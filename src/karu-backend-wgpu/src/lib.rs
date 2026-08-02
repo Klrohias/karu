@@ -124,15 +124,27 @@ impl WgpuApp {
     }
 
     fn request_redraw(&mut self) {
+        if self.redraw_pending {
+            return;
+        }
         self.redraw_pending = true;
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
         }
     }
 
+    fn request_redraw_if_needed(&mut self) {
+        let dirty = self
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.composition.is_dirty());
+        if dirty {
+            self.request_redraw();
+        }
+    }
+
     fn redraw(&mut self) {
         self.redraw_pending = false;
-        let frame_started = Instant::now();
         let Some(window) = self.window.as_ref() else {
             return;
         };
@@ -147,42 +159,23 @@ impl WgpuApp {
         }
         let logical_width = physical.width as f32 / scale.max(0.001);
         let logical_height = physical.height as f32 / scale.max(0.001);
-        let resize_started = Instant::now();
         runtime.renderer.resize_with_scale(physical, scale);
         runtime
             .composition
             .set_constraints(Constraints::loose(logical_width, logical_height));
-        let resize_elapsed = resize_started.elapsed();
 
-        let recompose_started = Instant::now();
         let recomposed_result = runtime
             .recomposer
             .recompose_with(&mut runtime.composition, &mut runtime.text_layout);
-        let recomposed = recomposed_result.is_some();
         let result = recomposed_result
             .or_else(|| runtime.composition.last_result().cloned())
             .expect("composition result exists");
-        let recompose_elapsed = recompose_started.elapsed();
 
-        let render_started = Instant::now();
         runtime
             .renderer
             .render(&result.render_tree, &result.commands)
             .expect("wgpu rendering failed");
-        let render_elapsed = render_started.elapsed();
         update_ime(window, &result.commands);
-
-        if self.debug_info {
-            println!(
-                "[karu][frame] total={:?} resize={:?} recompose={:?} recomposed={} render={:?} commands={}",
-                frame_started.elapsed(),
-                resize_elapsed,
-                recompose_elapsed,
-                recomposed,
-                render_elapsed,
-                result.commands.len(),
-            );
-        }
     }
 
     fn dispatch_pointer(&mut self, event: PointerEvent) {
@@ -322,7 +315,7 @@ impl ApplicationHandler for WgpuApp {
                     position: self.cursor,
                     primary: false,
                 });
-                self.request_redraw();
+                self.request_redraw_if_needed();
             }
             WindowEvent::MouseInput { state, button, .. } if button == MouseButton::Left => {
                 self.dispatch_pointer(PointerEvent {
@@ -335,7 +328,7 @@ impl ApplicationHandler for WgpuApp {
                     position: self.cursor,
                     primary: true,
                 });
-                self.request_redraw();
+                self.request_redraw_if_needed();
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let delta = match delta {
@@ -345,7 +338,7 @@ impl ApplicationHandler for WgpuApp {
                     }
                 };
                 self.dispatch_scroll(delta);
-                self.request_redraw();
+                self.request_redraw_if_needed();
             }
             WindowEvent::Touch(touch) => {
                 self.cursor = logical_position(touch.location, self.window.as_ref());
@@ -360,7 +353,7 @@ impl ApplicationHandler for WgpuApp {
                     position: self.cursor,
                     primary: true,
                 });
-                self.request_redraw();
+                self.request_redraw_if_needed();
             }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
@@ -386,7 +379,7 @@ impl ApplicationHandler for WgpuApp {
                         });
                     }
                 }
-                self.request_redraw();
+                self.request_redraw_if_needed();
             }
             WindowEvent::Ime(ime) => {
                 match ime {
@@ -413,7 +406,7 @@ impl ApplicationHandler for WgpuApp {
                         });
                     }
                 }
-                self.request_redraw();
+                self.request_redraw_if_needed();
             }
             WindowEvent::RedrawRequested => self.redraw(),
             _ => {}
@@ -421,11 +414,7 @@ impl ApplicationHandler for WgpuApp {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if self.debug_info || self.redraw_pending {
-            if let Some(window) = self.window.as_ref() {
-                window.request_redraw();
-            }
-        }
+        self.request_redraw_if_needed();
     }
 }
 
@@ -591,8 +580,6 @@ struct CachedTextResource {
 #[derive(Default)]
 struct TextResourceCache {
     entries: HashMap<TextResourceKey, CachedTextResource>,
-    frame_hits: usize,
-    frame_misses: usize,
 }
 
 struct CachedShapeResource {
@@ -604,16 +591,9 @@ struct CachedShapeResource {
 #[derive(Default)]
 struct ShapeResourceCache {
     entries: Vec<Option<CachedShapeResource>>,
-    frame_hits: usize,
-    frame_misses: usize,
 }
 
 impl ShapeResourceCache {
-    fn begin_frame(&mut self) {
-        self.frame_hits = 0;
-        self.frame_misses = 0;
-    }
-
     fn prepare<'a>(
         &'a mut self,
         commands: &[RenderCommand],
@@ -633,7 +613,6 @@ impl ShapeResourceCache {
                 .as_ref()
                 .is_some_and(|resource| resource.fingerprint == fingerprint);
             if cached {
-                self.frame_hits += 1;
                 continue;
             }
 
@@ -648,7 +627,6 @@ impl ShapeResourceCache {
                 buffer,
                 vertex_count,
             });
-            self.frame_misses += 1;
         }
 
         commands
@@ -666,11 +644,6 @@ impl ShapeResourceCache {
 
 impl TextResourceCache {
     const CAPACITY: usize = 512;
-
-    fn begin_frame(&mut self) {
-        self.frame_hits = 0;
-        self.frame_misses = 0;
-    }
 }
 
 struct FrameStats {
@@ -933,7 +906,6 @@ impl WgpuBackend {
     }
 
     fn render_commands(&mut self, commands: &[RenderCommand]) {
-        let render_started = Instant::now();
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
@@ -943,11 +915,8 @@ impl WgpuBackend {
             | wgpu::CurrentSurfaceTexture::Lost
             | wgpu::CurrentSurfaceTexture::Validation => return,
         };
-        let frame_acquire_elapsed = render_started.elapsed();
-        self.shape_cache.begin_frame();
         if self.debug_info {
             self.frame_stats.tick();
-            self.text_cache.begin_frame();
         }
         let view = frame
             .texture
@@ -961,27 +930,7 @@ impl WgpuBackend {
         let surface_width = self.config.width;
         let surface_height = self.config.height;
         let device = &self.device;
-        let shape_count = commands
-            .iter()
-            .filter(|command| {
-                matches!(
-                    command,
-                    RenderCommand::FillRect { .. }
-                        | RenderCommand::FillBrush { .. }
-                        | RenderCommand::StrokeRect { .. }
-                        | RenderCommand::DrawSelection { .. }
-                        | RenderCommand::DrawCursor { .. }
-                        | RenderCommand::DrawComposition { .. }
-                )
-            })
-            .count();
-        let text_count = commands
-            .iter()
-            .filter(|command| matches!(command, RenderCommand::DrawText { .. }))
-            .count();
-        let buffers_started = Instant::now();
         let shape_buffers = self.shape_cache.prepare(commands, device);
-        let buffers_elapsed = buffers_started.elapsed();
         let debug_info_buffer = self.debug_info.then(|| {
             let vertices = rect_vertices(
                 Rect::new(8.0, 8.0, 86.0, 28.0),
@@ -1001,8 +950,6 @@ impl WgpuBackend {
         let sampler = &self.sampler;
         let text_rasterizer = &mut self.text_rasterizer;
         let text_cache = &mut self.text_cache;
-        let mut text_elapsed = Duration::ZERO;
-        let encode_started = Instant::now();
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("karu-wgpu-render-pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1046,7 +993,6 @@ impl WgpuBackend {
                     offset,
                     ..
                 } => {
-                    let text_started = Instant::now();
                     text_cache.draw(
                         &mut pass,
                         device,
@@ -1064,7 +1010,6 @@ impl WgpuBackend {
                         *offset,
                         scale,
                     );
-                    text_elapsed += text_started.elapsed();
                 }
                 RenderCommand::PushClip(rect) => {
                     let logical = clips
@@ -1092,7 +1037,6 @@ impl WgpuBackend {
         }
         if self.debug_info {
             pass.set_scissor_rect(0, 0, surface_width, surface_height);
-            let debug_text_started = Instant::now();
             draw_debug_info(
                 &mut pass,
                 device,
@@ -1110,32 +1054,10 @@ impl WgpuBackend {
                 self.frame_stats.fps,
                 scale,
             );
-            text_elapsed += debug_text_started.elapsed();
         }
         drop(pass);
-        let encode_elapsed = encode_started.elapsed();
-        let submit_started = Instant::now();
         queue.submit(Some(encoder.finish()));
         frame.present();
-        let submit_elapsed = submit_started.elapsed();
-        if self.debug_info {
-            println!(
-                "[karu][wgpu] total={:?} acquire={:?} buffers={:?} encode={:?} text={:?} submit={:?} commands={} shapes={} texts={} shape_hits={} shape_misses={} text_hits={} text_misses={}",
-                render_started.elapsed(),
-                frame_acquire_elapsed,
-                buffers_elapsed,
-                encode_elapsed,
-                text_elapsed,
-                submit_elapsed,
-                commands.len(),
-                shape_count,
-                text_count,
-                self.shape_cache.frame_hits,
-                self.shape_cache.frame_misses,
-                text_cache.frame_hits,
-                text_cache.frame_misses,
-            );
-        }
     }
 }
 
@@ -1284,9 +1206,6 @@ impl TextResourceCache {
                     vertex_buffer,
                 },
             );
-            self.frame_misses += 1;
-        } else {
-            self.frame_hits += 1;
         }
 
         let Some(resource) = self.entries.get(&key) else {
@@ -2203,11 +2122,34 @@ fn paragraph_starts(text: &str) -> Vec<usize> {
 mod tests {
     use super::*;
 
+    fn test_app(debug_info: bool) -> WgpuApp {
+        WgpuApp::new(Box::new(|| {}), AppConfig::default(), None, debug_info)
+    }
+
     #[test]
     fn debug_info_is_opt_in() {
         assert!(!ConfiguredWgpu::default().debug_info);
         assert!(Wgpu.default_system_font().enable_debug_info().debug_info);
         assert!(Wgpu.enable_debug_info().debug_info);
+    }
+
+    #[test]
+    fn redraw_requests_are_coalesced() {
+        let mut app = test_app(false);
+
+        app.request_redraw();
+        app.request_redraw();
+
+        assert!(app.redraw_pending);
+    }
+
+    #[test]
+    fn debug_info_does_not_request_an_idle_redraw() {
+        let mut app = test_app(true);
+
+        app.request_redraw_if_needed();
+
+        assert!(!app.redraw_pending);
     }
 
     #[test]
