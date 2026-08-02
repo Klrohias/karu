@@ -382,6 +382,48 @@ fn state_updates_enqueue_recompose_requests_without_running_root() {
 }
 
 #[composable]
+fn ParameterizedChild(value: String, renders: Rc<RefCell<usize>>) {
+    *renders.borrow_mut() += 1;
+    Text(value, TextOptions::default());
+}
+
+#[composable]
+fn ParameterizedParent(
+    state_out: Rc<RefCell<Option<MutableState<i32>>>>,
+    child_renders: Rc<RefCell<usize>>,
+) {
+    let state = remember_mutable_state(|| 0);
+    *state_out.borrow_mut() = Some(state.clone());
+    ParameterizedChild(state.get().to_string(), child_renders);
+}
+
+#[test]
+fn dirty_parent_does_not_reuse_children_with_stale_parameters() {
+    let state_out = Rc::new(RefCell::new(None));
+    let child_renders = Rc::new(RefCell::new(0));
+    let mut composition = {
+        let state_out = state_out.clone();
+        let child_renders = child_renders.clone();
+        Composition::new(move || ParameterizedParent(state_out.clone(), child_renders.clone()))
+    };
+    let mut recomposer = Recomposer::new();
+    let mut layout = HeadlessTextLayout;
+
+    let first = recomposer
+        .recompose_with(&mut composition, &mut layout)
+        .expect("initial composition");
+    assert_eq!(text_value(only_text_command(&first.commands)), "0");
+    assert_eq!(*child_renders.borrow(), 1);
+
+    state_out.borrow().as_ref().unwrap().set(1);
+    let second = recomposer
+        .recompose_with(&mut composition, &mut layout)
+        .expect("dirty composition");
+    assert_eq!(text_value(only_text_command(&second.commands)), "1");
+    assert_eq!(*child_renders.borrow(), 2);
+}
+
+#[composable]
 fn StateReader(state: MutableState<i32>) {
     Text(state.get().to_string(), TextOptions::default());
 }

@@ -56,6 +56,18 @@ impl ElementApplier {
     pub fn new(root: Element) -> Self {
         Self { stack: vec![root] }
     }
+
+    fn pop_node(&mut self) -> Element {
+        self.stack.pop().expect("applier node stack is empty")
+    }
+
+    fn append_node(&mut self, node: Element) {
+        self.stack
+            .last_mut()
+            .expect("applier cannot append without a parent")
+            .children
+            .push(node);
+    }
 }
 
 impl Applier for ElementApplier {
@@ -64,15 +76,8 @@ impl Applier for ElementApplier {
     }
 
     fn end_node(&mut self) {
-        let node = self
-            .stack
-            .pop()
-            .expect("applier end_node called without a matching begin_node");
-        self.stack
-            .last_mut()
-            .expect("applier cannot end the root node")
-            .children
-            .push(node);
+        let node = self.pop_node();
+        self.append_node(node);
     }
 
     fn finish(&mut self) -> Result<Element, CompositionError> {
@@ -125,6 +130,17 @@ impl Drop for CurrentComposerGuard {
 
 struct NodeFrameGuard {
     inner: Rc<RefCell<ComposerInner>>,
+}
+
+struct ComponentFrameGuard {
+    inner: Rc<RefCell<ComposerInner>>,
+    scope: RecomposeScopeId,
+}
+
+impl Drop for ComponentFrameGuard {
+    fn drop(&mut self) {
+        self.inner.borrow_mut().end_component_node(&self.scope);
+    }
 }
 
 impl Drop for NodeFrameGuard {
@@ -413,12 +429,12 @@ impl Composition {
 
     pub fn compose(&mut self) -> CompositionResult {
         let mut layout = HeadlessTextLayout;
-        self.run(&mut layout)
+        self.run(&mut layout, true)
     }
 
     pub fn recompose(&mut self) -> CompositionResult {
         let mut layout = HeadlessTextLayout;
-        self.run(&mut layout)
+        self.run(&mut layout, true)
     }
 
     pub fn recompose_if_needed(&mut self) -> Option<CompositionResult> {
@@ -430,7 +446,7 @@ impl Composition {
     }
 
     pub fn compose_with<L: TextLayoutEngine>(&mut self, layout: &mut L) -> CompositionResult {
-        self.run(layout)
+        self.run(layout, false)
     }
 
     pub fn render_with<L: TextLayoutEngine, B: RenderBackend>(
@@ -438,7 +454,7 @@ impl Composition {
         layout: &mut L,
         backend: &mut B,
     ) -> Result<B::Output, B::Error> {
-        let result = self.compose_with(layout);
+        let result = self.run(layout, true);
         backend.render(&result.render_tree, &result.commands)
     }
 
@@ -554,7 +570,10 @@ impl Composition {
         self.last_result.as_ref()
     }
 
-    fn run(&mut self, layout: &mut dyn TextLayoutEngine) -> CompositionResult {
+    fn run(&mut self, layout: &mut dyn TextLayoutEngine, force_full: bool) -> CompositionResult {
+        if force_full {
+            self.composer.inner.borrow().invalidation.mark_dirty();
+        }
         let started = Instant::now();
         self.composer.begin_composition();
 
@@ -590,8 +609,12 @@ impl Composition {
         let commands_started = Instant::now();
         let commands = crate::renderer::commands_for_tree_with_layout(&render_tree.root, layout);
         let commands_elapsed = commands_started.elapsed();
+        let (scope_hits, scope_misses) = {
+            let inner = self.composer.inner.borrow();
+            (inner.scope_cache_hits, inner.scope_cache_misses)
+        };
         println!(
-            "[karu][compose] total={:?} root={:?} finish={:?} effects={:?} layout={:?} commands={:?} render_commands={}",
+            "[karu][compose] total={:?} root={:?} finish={:?} effects={:?} layout={:?} commands={:?} render_commands={} scope_hits={} scope_misses={}",
             started.elapsed(),
             root_elapsed,
             finish_elapsed,
@@ -599,6 +622,8 @@ impl Composition {
             layout_elapsed,
             commands_elapsed,
             commands.len(),
+            scope_hits,
+            scope_misses,
         );
         let result = CompositionResult {
             root,
@@ -666,6 +691,23 @@ pub fn with_component_scope<R>(
     body(composer)
 }
 
+#[doc(hidden)]
+pub fn with_component_scope_unit(
+    composer: &mut Composer,
+    name: &'static str,
+    body: impl FnOnce(&mut Composer),
+) {
+    let Some(scope) = composer.inner.borrow_mut().begin_component_node(name) else {
+        return;
+    };
+    let frame_guard = ComponentFrameGuard {
+        inner: composer.inner.clone(),
+        scope,
+    };
+    body(composer);
+    drop(frame_guard);
+}
+
 pub(crate) fn emit_node(
     composer: &mut Composer,
     kind: ElementKind,
@@ -720,6 +762,8 @@ impl InvalidationHandle {
 struct InvalidationState {
     composition_id: Cell<CompositionId>,
     dirty: Cell<bool>,
+    force_full: Cell<bool>,
+    dirty_scopes: RefCell<HashSet<RecomposeScopeId>>,
     active_scopes: RefCell<HashSet<RecomposeScopeId>>,
     requests: RefCell<Vec<RecomposeRequest>>,
     callback: RefCell<Option<RecomposeCallback>>,
@@ -730,6 +774,8 @@ impl InvalidationState {
         Self {
             composition_id: Cell::new(composition_id),
             dirty: Cell::new(false),
+            force_full: Cell::new(false),
+            dirty_scopes: RefCell::new(HashSet::new()),
             active_scopes: RefCell::new(HashSet::new()),
             requests: RefCell::new(Vec::new()),
             callback: RefCell::new(None),
@@ -754,12 +800,12 @@ impl InvalidationState {
             return;
         }
         drop(active_scopes);
+        self.dirty.set(true);
+        self.dirty_scopes.borrow_mut().insert(scope.clone());
         let request = RecomposeRequest {
             composition_id: self.composition_id.get(),
             scope,
         };
-
-        self.dirty.set(true);
         self.requests.borrow_mut().push(request.clone());
 
         if let Some(callback) = self.callback.borrow().as_ref() {
@@ -777,10 +823,14 @@ impl InvalidationState {
 
     fn mark_dirty(&self) {
         self.dirty.set(true);
+        self.force_full.set(true);
     }
 
-    fn clear_dirty(&self) {
+    fn take_dirty(&self) -> (bool, HashSet<RecomposeScopeId>) {
+        let force_full = self.force_full.replace(false);
+        let scopes = std::mem::take(&mut *self.dirty_scopes.borrow_mut());
         self.dirty.set(false);
+        (force_full, scopes)
     }
 
     fn take_requests(&self) -> Vec<RecomposeRequest> {
@@ -804,6 +854,12 @@ pub(crate) struct ComposerInner {
     launched_effects: HashMap<Vec<usize>, LaunchedEffectSlot>,
     used_launched_effects: HashSet<Vec<usize>>,
     pending_launched_effects: Vec<PendingLaunchedEffect>,
+    component_cache: HashMap<RecomposeScopeId, ComponentCacheEntry>,
+    dirty_scopes: HashSet<RecomposeScopeId>,
+    force_full_recompose: bool,
+    dirty_component_stack: Vec<bool>,
+    scope_cache_hits: usize,
+    scope_cache_misses: usize,
     task_runtime: Option<Rc<dyn TaskRuntime>>,
     invalidation: Rc<InvalidationState>,
     events: EventRegistry,
@@ -827,6 +883,12 @@ impl ComposerInner {
             launched_effects: HashMap::new(),
             used_launched_effects: HashSet::new(),
             pending_launched_effects: Vec::new(),
+            component_cache: HashMap::new(),
+            dirty_scopes: HashSet::new(),
+            force_full_recompose: false,
+            dirty_component_stack: Vec::new(),
+            scope_cache_hits: 0,
+            scope_cache_misses: 0,
             task_runtime: None,
             invalidation,
             events: EventRegistry::default(),
@@ -842,6 +904,10 @@ impl ComposerInner {
         self.pending_disposable_effects.clear();
         self.used_launched_effects.clear();
         self.pending_launched_effects.clear();
+        self.dirty_component_stack.clear();
+        self.scope_cache_hits = 0;
+        self.scope_cache_misses = 0;
+        (self.force_full_recompose, self.dirty_scopes) = self.invalidation.take_dirty();
         self.events.begin_composition();
         let root_id = self.node_id_for(&[]);
         self.applier =
@@ -850,7 +916,6 @@ impl ComposerInner {
             path: Vec::new(),
             next_slot: 0,
         });
-        self.invalidation.clear_dirty();
     }
 
     fn finish_composition(&mut self) -> Result<Element, CompositionError> {
@@ -862,6 +927,8 @@ impl ComposerInner {
             .retain(|path, _| self.used_state_paths.contains(path));
         self.node_ids
             .retain(|path, _| self.used_node_paths.contains(path));
+        self.component_cache
+            .retain(|scope, _| self.used_node_paths.contains(&scope.0));
         self.invalidation.set_active_scopes(
             self.used_node_paths
                 .iter()
@@ -935,6 +1002,95 @@ impl ComposerInner {
         modifier.install_events(id, &mut self.events);
         self.frames.push(Frame { path, next_slot: 0 });
         self.applier.begin_node(Element::new(id, kind, modifier));
+    }
+
+    fn begin_component_node(&mut self, name: &'static str) -> Option<RecomposeScopeId> {
+        let path = self.next_slot_path();
+        let scope = RecomposeScopeId(path.clone());
+        let inherited_dirty = self.dirty_component_stack.last().copied().unwrap_or(false);
+        let exact_dirty = self.dirty_scopes.contains(&scope);
+        let descendant_dirty = self
+            .dirty_scopes
+            .iter()
+            .any(|dirty| dirty.0.len() > scope.0.len() && dirty.0.starts_with(&scope.0));
+        let dirty = self.force_full_recompose || inherited_dirty || exact_dirty || descendant_dirty;
+        if !dirty && let Some(entry) = self.component_cache.get(&scope).cloned() {
+            self.scope_cache_hits += 1;
+            self.use_component_cache(&entry);
+            self.restore_events(&entry.element);
+            self.applier.append_node(entry.element);
+            return None;
+        }
+
+        let id = self.node_id_for(&path);
+        self.scope_cache_misses += 1;
+        let modifier = Modifier::empty();
+        modifier.install_events(id, &mut self.events);
+        self.frames.push(Frame { path, next_slot: 0 });
+        self.dirty_component_stack
+            .push(self.force_full_recompose || inherited_dirty || exact_dirty);
+        self.applier
+            .begin_node(Element::new(id, ElementKind::Component(name), modifier));
+        Some(scope)
+    }
+
+    fn end_component_node(&mut self, scope: &RecomposeScopeId) {
+        self.frames
+            .pop()
+            .expect("component end called without an active node frame");
+        self.dirty_component_stack
+            .pop()
+            .expect("component dirty stack is unbalanced");
+        let node = self.applier.pop_node();
+        self.applier.append_node(node.clone());
+        let entry = ComponentCacheEntry {
+            element: node,
+            node_paths: self
+                .used_node_paths
+                .iter()
+                .filter(|path| path.starts_with(&scope.0))
+                .cloned()
+                .collect(),
+            state_paths: self
+                .used_state_paths
+                .iter()
+                .filter(|path| path.starts_with(&scope.0))
+                .cloned()
+                .collect(),
+            disposable_paths: self
+                .used_disposable_effects
+                .iter()
+                .filter(|path| path.starts_with(&scope.0))
+                .cloned()
+                .collect(),
+            launched_paths: self
+                .used_launched_effects
+                .iter()
+                .filter(|path| path.starts_with(&scope.0))
+                .cloned()
+                .collect(),
+        };
+        self.component_cache.insert(scope.clone(), entry);
+    }
+
+    fn use_component_cache(&mut self, entry: &ComponentCacheEntry) {
+        self.used_node_paths
+            .extend(entry.node_paths.iter().cloned());
+        self.used_state_paths
+            .extend(entry.state_paths.iter().cloned());
+        self.used_disposable_effects
+            .extend(entry.disposable_paths.iter().cloned());
+        self.used_launched_effects
+            .extend(entry.launched_paths.iter().cloned());
+    }
+
+    fn restore_events(&mut self, element: &Element) {
+        element
+            .modifier
+            .install_events(element.id, &mut self.events);
+        for child in &element.children {
+            self.restore_events(child);
+        }
     }
 
     fn end_node(&mut self) {
@@ -1086,6 +1242,15 @@ impl ComposerInner {
         self.node_ids.insert(path.to_vec(), id);
         id
     }
+}
+
+#[derive(Clone)]
+struct ComponentCacheEntry {
+    element: Element,
+    node_paths: Vec<Vec<usize>>,
+    state_paths: Vec<Vec<usize>>,
+    disposable_paths: Vec<Vec<usize>>,
+    launched_paths: Vec<Vec<usize>>,
 }
 
 struct Frame {

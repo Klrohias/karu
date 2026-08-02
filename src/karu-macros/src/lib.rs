@@ -53,7 +53,7 @@ pub fn composable(_attr: TokenStream, input: TokenStream) -> TokenStream {
         #[allow(non_snake_case)]
         #(#hidden_attrs)*
         #vis #hidden_sig {
-            ::karu::__private::with_component_scope(__composer, #name, |__composer| {
+            ::karu::__private::with_component_scope_unit(__composer, #name, |__composer| {
                 use ::karu::__private::*;
                 #hidden_block
             })

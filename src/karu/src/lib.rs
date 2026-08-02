@@ -62,7 +62,7 @@ pub use ui::{
 pub mod __private {
     pub use crate::composition::{
         disposable_effect, key, launched_effect, provide, side_effect, with_component_scope,
-        with_current_composer,
+        with_component_scope_unit, with_current_composer,
     };
     pub use crate::state::{
         remember, remember_keyed, remember_mutable_state, remember_updated_state,
