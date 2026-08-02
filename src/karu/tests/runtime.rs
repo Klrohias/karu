@@ -145,7 +145,7 @@ fn composition_uses_renderer_text_queries_for_layout_and_commands() {
         .find(*node_id)
         .expect("text node exists");
 
-    assert!(calls.get() >= 2);
+    assert_eq!(calls.get(), 1);
     assert!(node.text_field.is_none());
 }
 

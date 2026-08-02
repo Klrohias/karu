@@ -7,7 +7,9 @@ use karu::{
     TextEditCommand, TextInputCommand, TextInputEvent, TextLayoutEngine, TextWrap,
 };
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::convert::Infallible;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -103,6 +105,7 @@ struct WgpuApp {
     runtime: Option<WgpuRuntime>,
     cursor: Offset,
     modifiers: ModifiersState,
+    redraw_pending: bool,
 }
 
 impl WgpuApp {
@@ -116,10 +119,20 @@ impl WgpuApp {
             runtime: None,
             cursor: Offset::ZERO,
             modifiers: ModifiersState::empty(),
+            redraw_pending: false,
+        }
+    }
+
+    fn request_redraw(&mut self) {
+        self.redraw_pending = true;
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
         }
     }
 
     fn redraw(&mut self) {
+        self.redraw_pending = false;
+        let frame_started = Instant::now();
         let Some(window) = self.window.as_ref() else {
             return;
         };
@@ -134,21 +147,42 @@ impl WgpuApp {
         }
         let logical_width = physical.width as f32 / scale.max(0.001);
         let logical_height = physical.height as f32 / scale.max(0.001);
+        let resize_started = Instant::now();
         runtime.renderer.resize_with_scale(physical, scale);
         runtime
             .composition
             .set_constraints(Constraints::loose(logical_width, logical_height));
+        let resize_elapsed = resize_started.elapsed();
 
-        let result = runtime
+        let recompose_started = Instant::now();
+        let recomposed_result = runtime
             .recomposer
-            .recompose_with(&mut runtime.composition, &mut runtime.text_layout)
+            .recompose_with(&mut runtime.composition, &mut runtime.text_layout);
+        let recomposed = recomposed_result.is_some();
+        let result = recomposed_result
             .or_else(|| runtime.composition.last_result().cloned())
             .expect("composition result exists");
+        let recompose_elapsed = recompose_started.elapsed();
+
+        let render_started = Instant::now();
         runtime
             .renderer
             .render(&result.render_tree, &result.commands)
             .expect("wgpu rendering failed");
+        let render_elapsed = render_started.elapsed();
         update_ime(window, &result.commands);
+
+        if self.debug_info {
+            println!(
+                "[karu][frame] total={:?} resize={:?} recompose={:?} recomposed={} render={:?} commands={}",
+                frame_started.elapsed(),
+                resize_elapsed,
+                recompose_elapsed,
+                recomposed,
+                render_elapsed,
+                result.commands.len(),
+            );
+        }
     }
 
     fn dispatch_pointer(&mut self, event: PointerEvent) {
@@ -255,7 +289,7 @@ impl ApplicationHandler for WgpuApp {
             composition,
             recomposer: Recomposer::new(),
         });
-        window.request_redraw();
+        self.request_redraw();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
@@ -268,19 +302,17 @@ impl ApplicationHandler for WgpuApp {
                 if let Some(runtime) = self.runtime.as_mut() {
                     runtime.renderer.resize(size);
                 }
-                if let Some(window) = self.window.as_ref() {
-                    window.request_redraw();
-                }
+                self.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { .. } => {
-                if let Some(window) = self.window.as_ref() {
+                if let Some(window) = self.window.clone() {
                     if let Some(runtime) = self.runtime.as_mut() {
                         runtime
                             .renderer
                             .resize_with_scale(window.inner_size(), window.scale_factor() as f32);
                     }
-                    window.request_redraw();
                 }
+                self.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = logical_position(position, self.window.as_ref());
@@ -290,6 +322,7 @@ impl ApplicationHandler for WgpuApp {
                     position: self.cursor,
                     primary: false,
                 });
+                self.request_redraw();
             }
             WindowEvent::MouseInput { state, button, .. } if button == MouseButton::Left => {
                 self.dispatch_pointer(PointerEvent {
@@ -302,6 +335,7 @@ impl ApplicationHandler for WgpuApp {
                     position: self.cursor,
                     primary: true,
                 });
+                self.request_redraw();
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let delta = match delta {
@@ -311,6 +345,7 @@ impl ApplicationHandler for WgpuApp {
                     }
                 };
                 self.dispatch_scroll(delta);
+                self.request_redraw();
             }
             WindowEvent::Touch(touch) => {
                 self.cursor = logical_position(touch.location, self.window.as_ref());
@@ -325,6 +360,7 @@ impl ApplicationHandler for WgpuApp {
                     position: self.cursor,
                     primary: true,
                 });
+                self.request_redraw();
             }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
@@ -350,39 +386,45 @@ impl ApplicationHandler for WgpuApp {
                         });
                     }
                 }
+                self.request_redraw();
             }
-            WindowEvent::Ime(ime) => match ime {
-                Ime::Enabled => {
-                    self.dispatch_text(TextInputEvent::CompositionStart {
-                        position: self.cursor,
-                    });
+            WindowEvent::Ime(ime) => {
+                match ime {
+                    Ime::Enabled => {
+                        self.dispatch_text(TextInputEvent::CompositionStart {
+                            position: self.cursor,
+                        });
+                    }
+                    Ime::Preedit(text, _) => {
+                        self.dispatch_text(TextInputEvent::CompositionUpdate {
+                            position: self.cursor,
+                            text,
+                        });
+                    }
+                    Ime::Commit(text) => {
+                        self.dispatch_text(TextInputEvent::CompositionCommit {
+                            position: self.cursor,
+                            text,
+                        });
+                    }
+                    Ime::Disabled => {
+                        self.dispatch_text(TextInputEvent::CompositionEnd {
+                            position: self.cursor,
+                        });
+                    }
                 }
-                Ime::Preedit(text, _) => {
-                    self.dispatch_text(TextInputEvent::CompositionUpdate {
-                        position: self.cursor,
-                        text,
-                    });
-                }
-                Ime::Commit(text) => {
-                    self.dispatch_text(TextInputEvent::CompositionCommit {
-                        position: self.cursor,
-                        text,
-                    });
-                }
-                Ime::Disabled => {
-                    self.dispatch_text(TextInputEvent::CompositionEnd {
-                        position: self.cursor,
-                    });
-                }
-            },
+                self.request_redraw();
+            }
             WindowEvent::RedrawRequested => self.redraw(),
             _ => {}
         }
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(window) = self.window.as_ref() {
-            window.request_redraw();
+        if self.debug_info || self.redraw_pending {
+            if let Some(window) = self.window.as_ref() {
+                window.request_redraw();
+            }
         }
     }
 }
@@ -521,9 +563,114 @@ pub struct WgpuBackend {
     sampler: wgpu::Sampler,
     text_context: Rc<RefCell<FontSystem>>,
     text_rasterizer: TextRasterizer,
+    text_cache: TextResourceCache,
+    shape_cache: ShapeResourceCache,
     clipboard: WgpuClipboard,
     debug_info: bool,
     frame_stats: FrameStats,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct TextResourceKey {
+    text: String,
+    font_size: u32,
+    color: [u32; 4],
+    rect: [u32; 4],
+    offset: [u32; 2],
+    wrap: u8,
+    scale_factor: u32,
+}
+
+struct CachedTextResource {
+    _texture: wgpu::Texture,
+    _view: wgpu::TextureView,
+    bind_group: wgpu::BindGroup,
+    vertex_buffer: wgpu::Buffer,
+}
+
+#[derive(Default)]
+struct TextResourceCache {
+    entries: HashMap<TextResourceKey, CachedTextResource>,
+    frame_hits: usize,
+    frame_misses: usize,
+}
+
+struct CachedShapeResource {
+    fingerprint: u64,
+    buffer: wgpu::Buffer,
+    vertex_count: u32,
+}
+
+#[derive(Default)]
+struct ShapeResourceCache {
+    entries: Vec<Option<CachedShapeResource>>,
+    frame_hits: usize,
+    frame_misses: usize,
+}
+
+impl ShapeResourceCache {
+    fn begin_frame(&mut self) {
+        self.frame_hits = 0;
+        self.frame_misses = 0;
+    }
+
+    fn prepare<'a>(
+        &'a mut self,
+        commands: &[RenderCommand],
+        device: &wgpu::Device,
+    ) -> Vec<Option<(&'a wgpu::Buffer, u32)>> {
+        if self.entries.len() < commands.len() {
+            self.entries.resize_with(commands.len(), || None);
+        }
+
+        for (index, command) in commands.iter().enumerate() {
+            let Some(vertices) = shape_vertices(command) else {
+                self.entries[index] = None;
+                continue;
+            };
+            let fingerprint = shape_fingerprint(&vertices);
+            let cached = self.entries[index]
+                .as_ref()
+                .is_some_and(|resource| resource.fingerprint == fingerprint);
+            if cached {
+                self.frame_hits += 1;
+                continue;
+            }
+
+            let vertex_count = vertices.len() as u32;
+            let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("karu-wgpu-shape-vertices"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            self.entries[index] = Some(CachedShapeResource {
+                fingerprint,
+                buffer,
+                vertex_count,
+            });
+            self.frame_misses += 1;
+        }
+
+        commands
+            .iter()
+            .enumerate()
+            .map(|(index, command)| {
+                shape_vertices(command)?;
+                self.entries[index]
+                    .as_ref()
+                    .map(|resource| (&resource.buffer, resource.vertex_count))
+            })
+            .collect()
+    }
+}
+
+impl TextResourceCache {
+    const CAPACITY: usize = 512;
+
+    fn begin_frame(&mut self) {
+        self.frame_hits = 0;
+        self.frame_misses = 0;
+    }
 }
 
 struct FrameStats {
@@ -746,6 +893,8 @@ impl WgpuBackend {
             sampler,
             text_context,
             text_rasterizer,
+            text_cache: TextResourceCache::default(),
+            shape_cache: ShapeResourceCache::default(),
             clipboard: WgpuClipboard,
             debug_info,
             frame_stats: FrameStats::new(),
@@ -784,6 +933,7 @@ impl WgpuBackend {
     }
 
     fn render_commands(&mut self, commands: &[RenderCommand]) {
+        let render_started = Instant::now();
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
@@ -793,8 +943,11 @@ impl WgpuBackend {
             | wgpu::CurrentSurfaceTexture::Lost
             | wgpu::CurrentSurfaceTexture::Validation => return,
         };
+        let frame_acquire_elapsed = render_started.elapsed();
+        self.shape_cache.begin_frame();
         if self.debug_info {
             self.frame_stats.tick();
+            self.text_cache.begin_frame();
         }
         let view = frame
             .texture
@@ -808,19 +961,27 @@ impl WgpuBackend {
         let surface_width = self.config.width;
         let surface_height = self.config.height;
         let device = &self.device;
-        let shape_buffers = commands
+        let shape_count = commands
             .iter()
-            .map(|command| {
-                let vertices = shape_vertices(command)?;
-                let vertex_count = vertices.len() as u32;
-                let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("karu-wgpu-shape-vertices"),
-                    contents: bytemuck::cast_slice(&vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-                Some((buffer, vertex_count))
+            .filter(|command| {
+                matches!(
+                    command,
+                    RenderCommand::FillRect { .. }
+                        | RenderCommand::FillBrush { .. }
+                        | RenderCommand::StrokeRect { .. }
+                        | RenderCommand::DrawSelection { .. }
+                        | RenderCommand::DrawCursor { .. }
+                        | RenderCommand::DrawComposition { .. }
+                )
             })
-            .collect::<Vec<_>>();
+            .count();
+        let text_count = commands
+            .iter()
+            .filter(|command| matches!(command, RenderCommand::DrawText { .. }))
+            .count();
+        let buffers_started = Instant::now();
+        let shape_buffers = self.shape_cache.prepare(commands, device);
+        let buffers_elapsed = buffers_started.elapsed();
         let debug_info_buffer = self.debug_info.then(|| {
             let vertices = rect_vertices(
                 Rect::new(8.0, 8.0, 86.0, 28.0),
@@ -839,6 +1000,9 @@ impl WgpuBackend {
         let text_bind_group_layout = &self.text_bind_group_layout;
         let sampler = &self.sampler;
         let text_rasterizer = &mut self.text_rasterizer;
+        let text_cache = &mut self.text_cache;
+        let mut text_elapsed = Duration::ZERO;
+        let encode_started = Instant::now();
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("karu-wgpu-render-pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -864,11 +1028,11 @@ impl WgpuBackend {
                 | RenderCommand::DrawSelection { .. }
                 | RenderCommand::DrawCursor { .. }
                 | RenderCommand::DrawComposition { .. } => {
-                    if let Some((buffer, vertex_count)) = &shape_buffers[command_index] {
+                    if let Some((buffer, vertex_count)) = shape_buffers[command_index] {
                         draw_shape(
                             &mut pass,
                             buffer,
-                            *vertex_count,
+                            vertex_count,
                             shape_pipeline,
                             screen_bind_group,
                         );
@@ -881,23 +1045,27 @@ impl WgpuBackend {
                     wrap,
                     offset,
                     ..
-                } => draw_text(
-                    &mut pass,
-                    device,
-                    queue,
-                    text_pipeline,
-                    screen_bind_group,
-                    text_bind_group_layout,
-                    sampler,
-                    text_rasterizer,
-                    *rect,
-                    text,
-                    style.font_size,
-                    style.color,
-                    *wrap,
-                    *offset,
-                    scale,
-                ),
+                } => {
+                    let text_started = Instant::now();
+                    text_cache.draw(
+                        &mut pass,
+                        device,
+                        queue,
+                        text_pipeline,
+                        screen_bind_group,
+                        text_bind_group_layout,
+                        sampler,
+                        text_rasterizer,
+                        *rect,
+                        text,
+                        style.font_size,
+                        style.color,
+                        *wrap,
+                        *offset,
+                        scale,
+                    );
+                    text_elapsed += text_started.elapsed();
+                }
                 RenderCommand::PushClip(rect) => {
                     let logical = clips
                         .last()
@@ -924,6 +1092,7 @@ impl WgpuBackend {
         }
         if self.debug_info {
             pass.set_scissor_rect(0, 0, surface_width, surface_height);
+            let debug_text_started = Instant::now();
             draw_debug_info(
                 &mut pass,
                 device,
@@ -933,6 +1102,7 @@ impl WgpuBackend {
                 screen_bind_group,
                 text_bind_group_layout,
                 sampler,
+                text_cache,
                 text_rasterizer,
                 debug_info_buffer
                     .as_ref()
@@ -940,121 +1110,194 @@ impl WgpuBackend {
                 self.frame_stats.fps,
                 scale,
             );
+            text_elapsed += debug_text_started.elapsed();
         }
         drop(pass);
+        let encode_elapsed = encode_started.elapsed();
+        let submit_started = Instant::now();
         queue.submit(Some(encoder.finish()));
         frame.present();
+        let submit_elapsed = submit_started.elapsed();
+        if self.debug_info {
+            println!(
+                "[karu][wgpu] total={:?} acquire={:?} buffers={:?} encode={:?} text={:?} submit={:?} commands={} shapes={} texts={} shape_hits={} shape_misses={} text_hits={} text_misses={}",
+                render_started.elapsed(),
+                frame_acquire_elapsed,
+                buffers_elapsed,
+                encode_elapsed,
+                text_elapsed,
+                submit_elapsed,
+                commands.len(),
+                shape_count,
+                text_count,
+                self.shape_cache.frame_hits,
+                self.shape_cache.frame_misses,
+                text_cache.frame_hits,
+                text_cache.frame_misses,
+            );
+        }
     }
 }
 
-fn draw_text<'a>(
-    pass: &mut wgpu::RenderPass<'a>,
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    text_pipeline: &wgpu::RenderPipeline,
-    screen_bind_group: &wgpu::BindGroup,
-    text_bind_group_layout: &wgpu::BindGroupLayout,
-    sampler: &wgpu::Sampler,
-    text_rasterizer: &mut TextRasterizer,
-    rect: Rect,
-    text: &str,
-    font_size: f32,
-    color: Color,
-    wrap: TextWrap,
-    offset: Offset,
-    scale_factor: f32,
-) {
-    let Some((width, height, pixels)) =
-        text_rasterizer.rasterize(&rect, text, font_size, color, wrap, offset, scale_factor)
-    else {
-        return;
-    };
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("karu-wgpu-texture"),
-        size: wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        &pixels,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(width * 4),
-            rows_per_image: Some(height),
-        },
-        wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("karu-wgpu-text-bind-group"),
-        layout: text_bind_group_layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&view),
+impl TextResourceCache {
+    fn draw<'a>(
+        &mut self,
+        pass: &mut wgpu::RenderPass<'a>,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        text_pipeline: &wgpu::RenderPipeline,
+        screen_bind_group: &wgpu::BindGroup,
+        text_bind_group_layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        text_rasterizer: &mut TextRasterizer,
+        rect: Rect,
+        text: &str,
+        font_size: f32,
+        color: Color,
+        wrap: TextWrap,
+        offset: Offset,
+        scale_factor: f32,
+    ) {
+        let scale_factor = normalized_scale(scale_factor);
+        let key = TextResourceKey {
+            text: text.to_string(),
+            font_size: font_size.to_bits(),
+            color: [color.red, color.green, color.blue, color.alpha].map(f32::to_bits),
+            rect: [
+                rect.size.width,
+                rect.size.height,
+                rect.origin.x,
+                rect.origin.y,
+            ]
+            .map(f32::to_bits),
+            offset: [offset.x, offset.y].map(f32::to_bits),
+            wrap: match wrap {
+                TextWrap::NoWrap => 0,
+                TextWrap::Word => 1,
+                TextWrap::Character => 2,
             },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(sampler),
-            },
-        ],
-    });
-    let x = rect.origin.x;
-    let y = rect.origin.y;
-    let vertices = [
-        TextVertex {
-            position: [x, y],
-            uv: [0.0, 0.0],
-        },
-        TextVertex {
-            position: [x + rect.size.width, y],
-            uv: [1.0, 0.0],
-        },
-        TextVertex {
-            position: [x + rect.size.width, y + rect.size.height],
-            uv: [1.0, 1.0],
-        },
-        TextVertex {
-            position: [x, y],
-            uv: [0.0, 0.0],
-        },
-        TextVertex {
-            position: [x + rect.size.width, y + rect.size.height],
-            uv: [1.0, 1.0],
-        },
-        TextVertex {
-            position: [x, y + rect.size.height],
-            uv: [0.0, 1.0],
-        },
-    ];
-    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("karu-wgpu-text-vertices"),
-        contents: bytemuck::cast_slice(&vertices),
-        usage: wgpu::BufferUsages::VERTEX,
-    });
-    pass.set_pipeline(text_pipeline);
-    pass.set_bind_group(0, screen_bind_group, &[]);
-    pass.set_bind_group(1, &bind_group, &[]);
-    pass.set_vertex_buffer(0, buffer.slice(..));
-    pass.draw(0..6, 0..1);
+            scale_factor: scale_factor.to_bits(),
+        };
+
+        if !self.entries.contains_key(&key) {
+            if self.entries.len() >= Self::CAPACITY {
+                self.entries.clear();
+            }
+            let Some((width, height, pixels)) = text_rasterizer.rasterize(
+                &rect,
+                text,
+                font_size,
+                color,
+                wrap,
+                offset,
+                scale_factor,
+            ) else {
+                return;
+            };
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("karu-wgpu-texture"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &pixels,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(width * 4),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("karu-wgpu-text-bind-group"),
+                layout: text_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                ],
+            });
+            let x = rect.origin.x;
+            let y = rect.origin.y;
+            let vertices = [
+                TextVertex {
+                    position: [x, y],
+                    uv: [0.0, 0.0],
+                },
+                TextVertex {
+                    position: [x + rect.size.width, y],
+                    uv: [1.0, 0.0],
+                },
+                TextVertex {
+                    position: [x + rect.size.width, y + rect.size.height],
+                    uv: [1.0, 1.0],
+                },
+                TextVertex {
+                    position: [x, y],
+                    uv: [0.0, 0.0],
+                },
+                TextVertex {
+                    position: [x + rect.size.width, y + rect.size.height],
+                    uv: [1.0, 1.0],
+                },
+                TextVertex {
+                    position: [x, y + rect.size.height],
+                    uv: [0.0, 1.0],
+                },
+            ];
+            let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("karu-wgpu-text-vertices"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            self.entries.insert(
+                key.clone(),
+                CachedTextResource {
+                    _texture: texture,
+                    _view: view,
+                    bind_group,
+                    vertex_buffer,
+                },
+            );
+            self.frame_misses += 1;
+        } else {
+            self.frame_hits += 1;
+        }
+
+        let Some(resource) = self.entries.get(&key) else {
+            return;
+        };
+        pass.set_pipeline(text_pipeline);
+        pass.set_bind_group(0, screen_bind_group, &[]);
+        pass.set_bind_group(1, &resource.bind_group, &[]);
+        pass.set_vertex_buffer(0, resource.vertex_buffer.slice(..));
+        pass.draw(0..6, 0..1);
+    }
 }
 
 impl RenderBackend for WgpuBackend {
@@ -1110,6 +1353,7 @@ fn draw_debug_info<'a>(
     screen_bind_group: &wgpu::BindGroup,
     text_bind_group_layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
+    text_cache: &mut TextResourceCache,
     text_rasterizer: &mut TextRasterizer,
     background_buffer: &'a wgpu::Buffer,
     fps: f32,
@@ -1125,7 +1369,7 @@ fn draw_debug_info<'a>(
     );
 
     let label = format!("FPS {:.0}", fps);
-    draw_text(
+    text_cache.draw(
         pass,
         device,
         queue,
@@ -1161,6 +1405,19 @@ fn shape_vertices(command: &RenderCommand) -> Option<Vec<ShapeVertex>> {
         _ => return None,
     };
     (!vertices.is_empty()).then_some(vertices)
+}
+
+fn shape_fingerprint(vertices: &[ShapeVertex]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for vertex in vertices {
+        for value in vertex.position {
+            value.to_bits().hash(&mut hasher);
+        }
+        for value in vertex.color {
+            value.to_bits().hash(&mut hasher);
+        }
+    }
+    hasher.finish()
 }
 
 fn rect_vertices(rect: Rect, color: Color) -> Vec<ShapeVertex> {
@@ -1507,6 +1764,15 @@ fn physical_text_extent(logical_size: f32, scale_factor: f32) -> u32 {
 pub struct CosmicTextLayout {
     context: Rc<RefCell<FontSystem>>,
     family: Option<String>,
+    geometry_cache: HashMap<TextGeometryKey, CosmicGeometry>,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct TextGeometryKey {
+    text: String,
+    font_size: u32,
+    max_width: u32,
+    wrap: u8,
 }
 
 impl CosmicTextLayout {
@@ -1515,10 +1781,39 @@ impl CosmicTextLayout {
     }
 
     fn with_context(context: Rc<RefCell<FontSystem>>, family: Option<String>) -> Self {
-        Self { context, family }
+        Self {
+            context,
+            family,
+            geometry_cache: HashMap::new(),
+        }
     }
 
     fn geometry(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        max_width: f32,
+        wrap: TextWrap,
+    ) -> CosmicGeometry {
+        let key = TextGeometryKey {
+            text: text.to_string(),
+            font_size: font_size.to_bits(),
+            max_width: max_width.to_bits(),
+            wrap: text_wrap_key(wrap),
+        };
+        if let Some(geometry) = self.geometry_cache.get(&key) {
+            return geometry.clone();
+        }
+
+        let geometry = self.build_geometry(text, font_size, max_width, wrap);
+        if self.geometry_cache.len() >= 512 {
+            self.geometry_cache.clear();
+        }
+        self.geometry_cache.insert(key, geometry.clone());
+        geometry
+    }
+
+    fn build_geometry(
         &mut self,
         text: &str,
         font_size: f32,
@@ -1735,11 +2030,20 @@ fn cosmic_color(color: Color) -> cosmic_text::Color {
     )
 }
 
+#[derive(Clone)]
 struct CosmicGeometry {
     size: Size,
     line_height: f32,
     lines: Vec<CosmicLine>,
     carets: Vec<CaretPosition>,
+}
+
+fn text_wrap_key(wrap: TextWrap) -> u8 {
+    match wrap {
+        TextWrap::NoWrap => 0,
+        TextWrap::Word => 1,
+        TextWrap::Character => 2,
+    }
 }
 #[derive(Clone)]
 struct CosmicLine {

@@ -14,6 +14,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::pin::Pin;
 use std::ptr;
 use std::rc::Rc;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CompositionId(pub usize);
@@ -554,27 +555,51 @@ impl Composition {
     }
 
     fn run(&mut self, layout: &mut dyn TextLayoutEngine) -> CompositionResult {
+        let started = Instant::now();
         self.composer.begin_composition();
 
         // Set thread-local composer pointer for the duration of root execution
         let composer_ptr: *mut Composer = &mut self.composer;
         let _composer_guard = CurrentComposerGuard::install(composer_ptr);
+        let root_started = Instant::now();
         (self.root)();
         drop(_composer_guard);
+        let root_elapsed = root_started.elapsed();
 
+        let finish_started = Instant::now();
         let root = self
             .composer
             .finish_composition()
             .expect("karu composition ended with an unbalanced node stack");
+        let finish_elapsed = finish_started.elapsed();
+
+        let effects_started = Instant::now();
         for effect in self.composer.take_side_effects() {
             effect();
         }
+        let effects_elapsed = effects_started.elapsed();
+
+        let layout_started = Instant::now();
         let layout_root = {
             let inner = self.composer.inner.borrow();
             layout_tree_with_events(&root, self.constraints, &inner.events, layout)
         };
+        let layout_elapsed = layout_started.elapsed();
         let render_tree = RenderTree { root: layout_root };
+
+        let commands_started = Instant::now();
         let commands = crate::renderer::commands_for_tree_with_layout(&render_tree.root, layout);
+        let commands_elapsed = commands_started.elapsed();
+        println!(
+            "[karu][compose] total={:?} root={:?} finish={:?} effects={:?} layout={:?} commands={:?} render_commands={}",
+            started.elapsed(),
+            root_elapsed,
+            finish_elapsed,
+            effects_elapsed,
+            layout_elapsed,
+            commands_elapsed,
+            commands.len(),
+        );
         let result = CompositionResult {
             root,
             render_tree,

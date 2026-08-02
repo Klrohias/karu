@@ -274,12 +274,9 @@ fn layout_element(
         ElementKind::Text(_) | ElementKind::Custom(_) => Vec::new(),
     };
 
-    let content_size = intrinsic_size(element, &children, child_constraints, layout);
-    let size = apply_modifier_size(&data, content_size, constraints);
-
     let text_size = match &element.kind {
         ElementKind::Text(text) => {
-            let max_width = (size.width - data.padding.horizontal()).max(0.0);
+            let max_width = layout_constraints.max_width;
             let mut text_size = layout.measure_text(
                 text,
                 data.font_size.unwrap_or(14.0),
@@ -298,6 +295,9 @@ fn layout_element(
         }
         _ => None,
     };
+    let content_size = intrinsic_size(element, &children, text_size);
+    let size = apply_modifier_size(&data, content_size, constraints);
+
     let text_scroll =
         if let (Some(text_size), Some(state)) = (text_size, element.modifier.text_field_state()) {
             let text = match &element.kind {
@@ -355,40 +355,6 @@ fn layout_element(
                 ScrollAxis::Horizontal => translate_node(child, -offset, 0.0),
                 ScrollAxis::Vertical => translate_node(child, 0.0, -offset),
             }
-        }
-    }
-
-    if matches!(
-        element.kind,
-        ElementKind::Root | ElementKind::Column | ElementKind::Row | ElementKind::Component(_)
-    ) && data.fill_max_width
-    {
-        let available = constraints.max_width;
-        if available.is_finite() {
-            children = match element.kind {
-                ElementKind::Row => layout_horizontal_children(
-                    &element.children,
-                    child_origin,
-                    Constraints {
-                        max_width: (available - data.padding.horizontal()).max(0.0),
-                        ..child_constraints
-                    },
-                    interactions,
-                    data.horizontal_arrangement,
-                    layout,
-                ),
-                _ => layout_vertical_children(
-                    &element.children,
-                    child_origin,
-                    Constraints {
-                        max_width: (available - data.padding.horizontal()).max(0.0),
-                        ..child_constraints
-                    },
-                    interactions,
-                    data.vertical_arrangement,
-                    layout,
-                ),
-            };
         }
     }
 
@@ -665,33 +631,9 @@ fn layout_stack_children(
         .collect()
 }
 
-fn intrinsic_size(
-    element: &Element,
-    children: &[LayoutNode],
-    constraints: Constraints,
-    layout: &mut dyn TextLayoutEngine,
-) -> Size {
+fn intrinsic_size(element: &Element, children: &[LayoutNode], text_size: Option<Size>) -> Size {
     match &element.kind {
-        ElementKind::Text(text) => {
-            let data = element.modifier.data();
-            let mut size = layout.measure_text(
-                text,
-                data.font_size.unwrap_or(14.0),
-                constraints.max_width,
-                data.text_wrap,
-            );
-            if let Some(min_lines) = data.text_min_lines {
-                size.height = size
-                    .height
-                    .max(min_lines.max(1) as f32 * data.font_size.unwrap_or(14.0) * (20.0 / 14.0));
-            }
-            if let Some(max_lines) = data.text_max_lines {
-                size.height = size
-                    .height
-                    .min(max_lines.max(1) as f32 * data.font_size.unwrap_or(14.0) * (20.0 / 14.0));
-            }
-            size
-        }
+        ElementKind::Text(_) => text_size.unwrap_or(Size::ZERO),
         ElementKind::Custom(_) => Size::ZERO,
         ElementKind::Root | ElementKind::Column | ElementKind::Component(_) => {
             let width = children
