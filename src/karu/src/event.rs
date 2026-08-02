@@ -48,12 +48,6 @@ pub enum KeyCode {
     Enter,
     Tab,
     Escape,
-    A,
-    C,
-    V,
-    X,
-    Y,
-    Z,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -71,6 +65,16 @@ impl KeyModifiers {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TextEditCommand {
+    SelectAll,
+    Copy,
+    Cut,
+    Paste,
+    Undo,
+    Redo,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct KeyEvent {
     pub code: KeyCode,
     pub modifiers: KeyModifiers,
@@ -79,14 +83,39 @@ pub struct KeyEvent {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TextInputEvent {
-    Insert { position: Offset, text: String },
-    Backspace { position: Offset },
-    Key { position: Offset, event: KeyEvent },
-    Paste { position: Offset, text: String },
-    CompositionStart { position: Offset },
-    CompositionUpdate { position: Offset, text: String },
-    CompositionCommit { position: Offset, text: String },
-    CompositionEnd { position: Offset },
+    Insert {
+        position: Offset,
+        text: String,
+    },
+    Backspace {
+        position: Offset,
+    },
+    Key {
+        position: Offset,
+        event: KeyEvent,
+    },
+    Command {
+        position: Offset,
+        command: TextEditCommand,
+    },
+    Paste {
+        position: Offset,
+        text: String,
+    },
+    CompositionStart {
+        position: Offset,
+    },
+    CompositionUpdate {
+        position: Offset,
+        text: String,
+    },
+    CompositionCommit {
+        position: Offset,
+        text: String,
+    },
+    CompositionEnd {
+        position: Offset,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -363,6 +392,7 @@ impl EventRegistry {
                 *position
             }
             TextInputEvent::Key { position, .. }
+            | TextInputEvent::Command { position, .. }
             | TextInputEvent::Paste { position, .. }
             | TextInputEvent::CompositionStart { position }
             | TextInputEvent::CompositionUpdate { position, .. }

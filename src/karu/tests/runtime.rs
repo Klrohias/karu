@@ -6,9 +6,9 @@ use karu::{
     FocusState, HeadlessBackend, HeadlessTextLayout, KeyCode, KeyEvent, KeyModifiers, LazyColumn,
     LazyColumnOptions, Modifier, MutableState, Offset, PointerEvent, PointerKind, PointerPhase,
     RecomposeRequest, Recomposer, Rect, RenderCommand, Row, RowOptions, ScrollEvent, ScrollState,
-    Size, TaskHandle, TaskRuntime, Text, TextFieldOptions, TextFieldState, TextInputCommand,
-    TextInputEvent, TextLayoutEngine, TextOptions, TextWrap, TweenSpec, composable,
-    composition_local_of, disposable_effect, key, mutable_state_of, provide,
+    Size, TaskHandle, TaskRuntime, Text, TextEditCommand, TextFieldOptions, TextFieldState,
+    TextInputCommand, TextInputEvent, TextLayoutEngine, TextOptions, TextWrap, TweenSpec,
+    composable, composition_local_of, disposable_effect, key, mutable_state_of, provide,
     remember_mutable_state, side_effect,
 };
 use std::cell::RefCell;
@@ -713,68 +713,25 @@ fn text_field_handles_cursor_selection_shortcuts_and_history() {
     });
     assert_eq!(state.selected_text().as_deref(), Some("t"));
 
-    state.handle_key(KeyEvent {
-        code: KeyCode::A,
-        modifiers: KeyModifiers {
-            ctrl: true,
-            ..Default::default()
-        },
-        repeat: false,
-    });
-    let copied = state.handle_key(KeyEvent {
-        code: KeyCode::C,
-        modifiers: KeyModifiers {
-            ctrl: true,
-            ..Default::default()
-        },
-        repeat: false,
-    });
+    state.handle_command(TextEditCommand::SelectAll);
+    let copied = state.handle_command(TextEditCommand::Copy);
     assert_eq!(
         copied.commands,
         vec![TextInputCommand::Copy("one two".to_string())]
     );
 
-    let cut = state.handle_key(KeyEvent {
-        code: KeyCode::X,
-        modifiers: KeyModifiers {
-            ctrl: true,
-            ..Default::default()
-        },
-        repeat: false,
-    });
+    let cut = state.handle_command(TextEditCommand::Cut);
     assert_eq!(
         cut.commands,
         vec![TextInputCommand::Cut("one two".to_string())]
     );
     assert_eq!(state.text(), "");
-    state.handle_key(KeyEvent {
-        code: KeyCode::Z,
-        modifiers: KeyModifiers {
-            ctrl: true,
-            ..Default::default()
-        },
-        repeat: false,
-    });
+    state.handle_command(TextEditCommand::Undo);
     assert_eq!(state.text(), "one two");
-    state.handle_key(KeyEvent {
-        code: KeyCode::Z,
-        modifiers: KeyModifiers {
-            ctrl: true,
-            shift: true,
-            ..Default::default()
-        },
-        repeat: false,
-    });
+    state.handle_command(TextEditCommand::Redo);
     assert_eq!(state.text(), "");
 
-    let paste = state.handle_key(KeyEvent {
-        code: KeyCode::V,
-        modifiers: KeyModifiers {
-            ctrl: true,
-            ..Default::default()
-        },
-        repeat: false,
-    });
+    let paste = state.handle_command(TextEditCommand::Paste);
     assert_eq!(paste.commands, vec![TextInputCommand::PasteRequest]);
 }
 
@@ -1019,6 +976,40 @@ fn basic_text_field_exposes_editing_state_and_semantics() {
         })
     );
     assert_eq!(state.text(), "draft");
+}
+
+#[test]
+fn basic_text_field_separates_character_input_from_edit_commands() {
+    let state = TextFieldState::new("draft");
+    let mut composition = Composition::new({
+        let state = state.clone();
+        move || TextFieldContent(state.clone())
+    });
+    composition.compose();
+
+    for text in ["a", "z", "x", "c", "v"] {
+        assert!(
+            composition.dispatch_text_input_event(TextInputEvent::Insert {
+                position: Offset::new(1.0, 1.0),
+                text: text.to_string(),
+            })
+        );
+    }
+    assert_eq!(state.text(), "draftazxcv");
+
+    composition.dispatch_text_input_event(TextInputEvent::Command {
+        position: Offset::new(1.0, 1.0),
+        command: TextEditCommand::SelectAll,
+    });
+    let copied = composition.dispatch_text_input_event_with_result(TextInputEvent::Command {
+        position: Offset::new(1.0, 1.0),
+        command: TextEditCommand::Copy,
+    });
+    assert_eq!(
+        copied.commands,
+        vec![TextInputCommand::Copy("draftazxcv".to_string())]
+    );
+    assert_eq!(state.text(), "draftazxcv");
 }
 
 #[test]

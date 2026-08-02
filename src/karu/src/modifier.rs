@@ -848,6 +848,7 @@ impl ModifierElement for TextInput {
                 state.replace_selection(text);
                 TextInputResult::handled()
             }
+            TextInputEvent::Command { command, .. } => state.handle_command(command),
             TextInputEvent::Backspace { .. } => {
                 state.backspace();
                 TextInputResult::handled()

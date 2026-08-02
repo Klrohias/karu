@@ -25,7 +25,7 @@ pub use composition::{
 pub use element::{CustomElement, Element, ElementKind, NodeId};
 pub use event::{
     EventRegistry, InteractionState, KeyCode, KeyEvent, KeyModifiers, PointerEvent, PointerKind,
-    PointerPhase, ScrollEvent, TextInputContext, TextInputEvent, TextPointerEvent,
+    PointerPhase, ScrollEvent, TextEditCommand, TextInputContext, TextInputEvent, TextPointerEvent,
 };
 pub use foundation::{
     Animatable, FocusRequester, FocusState, ScrollState, TextFieldState, TextFieldValue, TweenSpec,

@@ -2,7 +2,10 @@ use crate::renderer::{TextInputCommand, TextLayoutEngine};
 use crate::text_layout::{
     TextWrap, grapheme_boundaries, next_grapheme_boundary, previous_grapheme_boundary,
 };
-use crate::{KeyCode, KeyEvent, MutableState, Offset, Size, TextInputResult, mutable_state_of};
+use crate::{
+    KeyCode, KeyEvent, MutableState, Offset, Size, TextEditCommand, TextInputResult,
+    mutable_state_of,
+};
 use std::cell::RefCell;
 use std::fmt;
 use std::ops::Range;
@@ -408,6 +411,36 @@ impl TextFieldState {
         self.handle_key_internal(event, None)
     }
 
+    pub fn handle_command(&self, command: TextEditCommand) -> TextInputResult {
+        match command {
+            TextEditCommand::SelectAll => {
+                self.select_all();
+                TextInputResult::handled()
+            }
+            TextEditCommand::Copy => self
+                .selected_text()
+                .map_or_else(TextInputResult::handled, |text| {
+                    TextInputResult::command(TextInputCommand::Copy(text))
+                }),
+            TextEditCommand::Cut => {
+                self.selected_text()
+                    .map_or_else(TextInputResult::handled, |text| {
+                        self.replace_selection("");
+                        TextInputResult::command(TextInputCommand::Cut(text))
+                    })
+            }
+            TextEditCommand::Paste => TextInputResult::command(TextInputCommand::PasteRequest),
+            TextEditCommand::Undo => {
+                self.undo();
+                TextInputResult::handled()
+            }
+            TextEditCommand::Redo => {
+                self.redo();
+                TextInputResult::handled()
+            }
+        }
+    }
+
     pub(crate) fn handle_key_with_layout(
         &self,
         event: KeyEvent,
@@ -436,35 +469,6 @@ impl TextFieldState {
     ) -> TextInputResult {
         let command = event.modifiers.command();
         match (event.code, command, event.modifiers.shift) {
-            (KeyCode::A, true, _) => {
-                self.select_all();
-                TextInputResult::handled()
-            }
-            (KeyCode::C, true, _) => self
-                .selected_text()
-                .map_or_else(TextInputResult::handled, |text| {
-                    TextInputResult::command(TextInputCommand::Copy(text))
-                }),
-            (KeyCode::X, true, _) => {
-                self.selected_text()
-                    .map_or_else(TextInputResult::handled, |text| {
-                        self.replace_selection("");
-                        TextInputResult::command(TextInputCommand::Cut(text))
-                    })
-            }
-            (KeyCode::V, true, _) => TextInputResult::command(TextInputCommand::PasteRequest),
-            (KeyCode::Z, true, false) => {
-                self.undo();
-                TextInputResult::handled()
-            }
-            (KeyCode::Z, true, true) => {
-                self.redo();
-                TextInputResult::handled()
-            }
-            (KeyCode::Y, true, false) => {
-                self.redo();
-                TextInputResult::handled()
-            }
             (KeyCode::Backspace, _, _) => {
                 if command {
                     self.delete_word_backward();

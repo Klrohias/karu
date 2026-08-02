@@ -3,7 +3,7 @@ use karu::{
     AppBackend, AppConfig, AppRoot, Brush, CaretAffinity, CaretPosition, Clipboard, ClipboardError,
     Color, Composition, Constraints, GradientStop, KeyCode, KeyEvent, KeyModifiers, Offset,
     PointerEvent, PointerPhase, Recomposer, Rect, RenderBackend, RenderCommand, Size,
-    TextInputCommand, TextInputEvent, TextLayoutEngine, TextWrap,
+    TextEditCommand, TextInputCommand, TextInputEvent, TextInputResult, TextLayoutEngine, TextWrap,
 };
 use macroquad::input::{
     KeyCode as QuadKeyCode, MouseButton, TouchPhase, get_char_pressed, is_key_down, is_key_pressed,
@@ -141,25 +141,35 @@ async fn run_quad(root: AppRoot, config: AppConfig, quad: ConfiguredQuad) {
                 mouse_position,
                 event,
             );
-            suppress_character_input |= result.handled;
-            for command in result.commands {
-                match command {
-                    TextInputCommand::Copy(text) | TextInputCommand::Cut(text) => {
-                        let _ = backend.clipboard().set_text(&text);
-                    }
-                    TextInputCommand::PasteRequest => {
-                        if let Ok(Some(text)) = backend.clipboard().get_text() {
-                            composition.dispatch_text_input_event_with(
-                                &mut text_layout,
-                                TextInputEvent::Paste {
-                                    position: mouse_position,
-                                    text,
-                                },
-                            );
-                        }
-                    }
-                }
+            suppress_character_input |= handle_text_result(
+                result,
+                &mut composition,
+                &mut text_layout,
+                &mut backend,
+                mouse_position,
+            );
+        }
+        for quad_key in shortcut_keys() {
+            if !is_key_pressed(quad_key) {
+                continue;
             }
+            let Some(command) = edit_command(quad_key, modifiers) else {
+                continue;
+            };
+            let result = composition.dispatch_text_input_event_with_result_with(
+                &mut text_layout,
+                TextInputEvent::Command {
+                    position: mouse_position,
+                    command,
+                },
+            );
+            suppress_character_input |= handle_text_result(
+                result,
+                &mut composition,
+                &mut text_layout,
+                &mut backend,
+                mouse_position,
+            );
         }
         if !suppress_character_input {
             while let Some(character) = get_char_pressed() {
@@ -810,7 +820,32 @@ fn paragraph_starts(text: &str) -> Vec<usize> {
     starts
 }
 
-fn keyboard_keys() -> [(QuadKeyCode, KeyCode); 17] {
+fn handle_text_result(
+    result: TextInputResult,
+    composition: &mut Composition,
+    text_layout: &mut CosmicTextLayout,
+    backend: &mut QuadBackend,
+    position: Offset,
+) -> bool {
+    for command in result.commands {
+        match command {
+            TextInputCommand::Copy(text) | TextInputCommand::Cut(text) => {
+                let _ = backend.clipboard().set_text(&text);
+            }
+            TextInputCommand::PasteRequest => {
+                if let Ok(Some(text)) = backend.clipboard().get_text() {
+                    composition.dispatch_text_input_event_with(
+                        text_layout,
+                        TextInputEvent::Paste { position, text },
+                    );
+                }
+            }
+        }
+    }
+    result.handled
+}
+
+fn keyboard_keys() -> [(QuadKeyCode, KeyCode); 11] {
     [
         (QuadKeyCode::Left, KeyCode::Left),
         (QuadKeyCode::Right, KeyCode::Right),
@@ -823,13 +858,34 @@ fn keyboard_keys() -> [(QuadKeyCode, KeyCode); 17] {
         (QuadKeyCode::Enter, KeyCode::Enter),
         (QuadKeyCode::Tab, KeyCode::Tab),
         (QuadKeyCode::Escape, KeyCode::Escape),
-        (QuadKeyCode::A, KeyCode::A),
-        (QuadKeyCode::C, KeyCode::C),
-        (QuadKeyCode::V, KeyCode::V),
-        (QuadKeyCode::X, KeyCode::X),
-        (QuadKeyCode::Y, KeyCode::Y),
-        (QuadKeyCode::Z, KeyCode::Z),
     ]
+}
+
+fn shortcut_keys() -> [QuadKeyCode; 6] {
+    [
+        QuadKeyCode::A,
+        QuadKeyCode::C,
+        QuadKeyCode::V,
+        QuadKeyCode::X,
+        QuadKeyCode::Y,
+        QuadKeyCode::Z,
+    ]
+}
+
+fn edit_command(key: QuadKeyCode, modifiers: KeyModifiers) -> Option<TextEditCommand> {
+    if !modifiers.command() {
+        return None;
+    }
+    Some(match key {
+        QuadKeyCode::A => TextEditCommand::SelectAll,
+        QuadKeyCode::C => TextEditCommand::Copy,
+        QuadKeyCode::V => TextEditCommand::Paste,
+        QuadKeyCode::X => TextEditCommand::Cut,
+        QuadKeyCode::Z if modifiers.shift => TextEditCommand::Redo,
+        QuadKeyCode::Z => TextEditCommand::Undo,
+        QuadKeyCode::Y => TextEditCommand::Redo,
+        _ => return None,
+    })
 }
 
 fn update_ime(commands: &[RenderCommand]) {
@@ -1039,6 +1095,32 @@ mod tests {
             })
             .expect("text command exists");
         assert!(command.size.width > 0.0 && command.size.height > 0.0);
+    }
+
+    #[test]
+    fn shortcut_mapping_keeps_textual_keys_out_of_key_mapping() {
+        assert!(keyboard_keys().iter().all(|(key, _)| {
+            !matches!(
+                key,
+                QuadKeyCode::A
+                    | QuadKeyCode::C
+                    | QuadKeyCode::V
+                    | QuadKeyCode::X
+                    | QuadKeyCode::Y
+                    | QuadKeyCode::Z
+            )
+        }));
+        assert_eq!(
+            edit_command(
+                QuadKeyCode::V,
+                KeyModifiers {
+                    ctrl: true,
+                    ..Default::default()
+                }
+            ),
+            Some(TextEditCommand::Paste)
+        );
+        assert_eq!(edit_command(QuadKeyCode::V, KeyModifiers::default()), None);
     }
 
     #[cfg(feature = "font-kit")]

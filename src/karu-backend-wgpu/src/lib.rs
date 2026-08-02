@@ -4,7 +4,7 @@ use karu::{
     AppBackend, AppConfig, AppRoot, Brush, CaretAffinity, CaretPosition, Clipboard, Color,
     Composition, Constraints, GradientStop, KeyCode, KeyEvent, KeyModifiers, Offset, PointerEvent,
     PointerKind, PointerPhase, Recomposer, Rect, RenderBackend, RenderCommand, Size,
-    TextInputCommand, TextInputEvent, TextLayoutEngine, TextWrap,
+    TextEditCommand, TextInputCommand, TextInputEvent, TextLayoutEngine, TextWrap,
 };
 use std::cell::RefCell;
 use std::convert::Infallible;
@@ -121,6 +121,7 @@ impl WgpuApp {
         }
         let logical_width = physical.width as f32 / scale.max(0.001);
         let logical_height = physical.height as f32 / scale.max(0.001);
+        runtime.renderer.resize_with_scale(physical, scale);
         runtime
             .composition
             .set_constraints(Constraints::loose(logical_width, logical_height));
@@ -315,7 +316,12 @@ impl ApplicationHandler for WgpuApp {
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let modifiers = to_modifiers(self.modifiers);
                 let mut suppress_text = modifiers.command() || modifiers.alt;
-                if let Some(code) = map_key(event.physical_key) {
+                if let Some(command) = map_edit_command(event.physical_key, modifiers) {
+                    suppress_text |= self.dispatch_text(TextInputEvent::Command {
+                        position: self.cursor,
+                        command,
+                    });
+                } else if let Some(code) = map_key(event.physical_key) {
                     suppress_text |= self.dispatch_key(KeyEvent {
                         code,
                         modifiers,
@@ -401,12 +407,25 @@ fn map_key(key: PhysicalKey) -> Option<KeyCode> {
         PhysicalKey::Code(WinitKeyCode::Enter) => KeyCode::Enter,
         PhysicalKey::Code(WinitKeyCode::Tab) => KeyCode::Tab,
         PhysicalKey::Code(WinitKeyCode::Escape) => KeyCode::Escape,
-        PhysicalKey::Code(WinitKeyCode::KeyA) => KeyCode::A,
-        PhysicalKey::Code(WinitKeyCode::KeyC) => KeyCode::C,
-        PhysicalKey::Code(WinitKeyCode::KeyV) => KeyCode::V,
-        PhysicalKey::Code(WinitKeyCode::KeyX) => KeyCode::X,
-        PhysicalKey::Code(WinitKeyCode::KeyY) => KeyCode::Y,
-        PhysicalKey::Code(WinitKeyCode::KeyZ) => KeyCode::Z,
+        _ => return None,
+    })
+}
+
+fn map_edit_command(key: PhysicalKey, modifiers: KeyModifiers) -> Option<TextEditCommand> {
+    if !modifiers.command() {
+        return None;
+    }
+    let PhysicalKey::Code(key) = key else {
+        return None;
+    };
+    Some(match key {
+        WinitKeyCode::KeyA => TextEditCommand::SelectAll,
+        WinitKeyCode::KeyC => TextEditCommand::Copy,
+        WinitKeyCode::KeyV => TextEditCommand::Paste,
+        WinitKeyCode::KeyX => TextEditCommand::Cut,
+        WinitKeyCode::KeyZ if modifiers.shift => TextEditCommand::Redo,
+        WinitKeyCode::KeyZ => TextEditCommand::Undo,
+        WinitKeyCode::KeyY => TextEditCommand::Redo,
         _ => return None,
     })
 }
@@ -486,7 +505,6 @@ pub struct WgpuBackend {
     screen_bind_group: wgpu::BindGroup,
     text_bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    shape_buffer: wgpu::Buffer,
     text_context: Rc<RefCell<FontSystem>>,
     text_rasterizer: TextRasterizer,
     clipboard: WgpuClipboard,
@@ -546,10 +564,11 @@ impl WgpuBackend {
             label: Some("karu-wgpu-shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
+        let scale_factor = window.scale_factor() as f32;
         let screen_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("karu-wgpu-screen"),
             contents: bytemuck::bytes_of(&ScreenUniform {
-                size: [size.width as f32, size.height as f32],
+                size: logical_surface_size(size, scale_factor),
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -663,25 +682,8 @@ impl WgpuBackend {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let shape_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("karu-wgpu-shape-buffer"),
-            size: 4096 * std::mem::size_of::<ShapeVertex>() as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         let text_context = Rc::new(RefCell::new(FontSystem::new()));
         let text_rasterizer = TextRasterizer::new(text_context.clone(), family);
-        let scale_factor = window.scale_factor() as f32;
-        queue.write_buffer(
-            &screen_buffer,
-            0,
-            bytemuck::bytes_of(&ScreenUniform {
-                size: [
-                    size.width as f32 / scale_factor.max(0.001),
-                    size.height as f32 / scale_factor.max(0.001),
-                ],
-            }),
-        );
         Self {
             surface,
             device,
@@ -695,7 +697,6 @@ impl WgpuBackend {
             screen_bind_group,
             text_bind_group_layout,
             sampler,
-            shape_buffer,
             text_context,
             text_rasterizer,
             clipboard: WgpuClipboard,
@@ -714,20 +715,23 @@ impl WgpuBackend {
         if size.width == 0 || size.height == 0 {
             return;
         }
-        self.scale_factor = scale_factor.max(0.001);
+        let scale_factor = scale_factor.max(0.001);
+        let surface_changed = self.config.width != size.width
+            || self.config.height != size.height
+            || self.scale_factor != scale_factor;
+        self.scale_factor = scale_factor;
         self.config.width = size.width;
         self.config.height = size.height;
         self.queue.write_buffer(
             &self.screen_buffer,
             0,
             bytemuck::bytes_of(&ScreenUniform {
-                size: [
-                    size.width as f32 / self.scale_factor,
-                    size.height as f32 / self.scale_factor,
-                ],
+                size: logical_surface_size(size, self.scale_factor),
             }),
         );
-        self.surface.configure(&self.device, &self.config);
+        if surface_changed {
+            self.surface.configure(&self.device, &self.config);
+        }
     }
 
     fn render_commands(&mut self, commands: &[RenderCommand]) {
@@ -751,10 +755,22 @@ impl WgpuBackend {
         let scale = self.scale_factor.max(0.001);
         let surface_width = self.config.width;
         let surface_height = self.config.height;
-        let queue = &self.queue;
         let device = &self.device;
+        let shape_buffers = commands
+            .iter()
+            .map(|command| {
+                let vertices = shape_vertices(command)?;
+                let vertex_count = vertices.len() as u32;
+                let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("karu-wgpu-shape-vertices"),
+                    contents: bytemuck::cast_slice(&vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                Some((buffer, vertex_count))
+            })
+            .collect::<Vec<_>>();
+        let queue = &self.queue;
         let shape_pipeline = &self.shape_pipeline;
-        let shape_buffer = &self.shape_buffer;
         let screen_bind_group = &self.screen_bind_group;
         let text_pipeline = &self.text_pipeline;
         let text_bind_group_layout = &self.text_bind_group_layout;
@@ -777,53 +793,23 @@ impl WgpuBackend {
             multiview_mask: None,
         });
         let mut clips = Vec::new();
-        for command in commands {
+        for (command_index, command) in commands.iter().enumerate() {
             match command {
-                RenderCommand::FillRect { rect, color, .. } => {
-                    draw_shape(
-                        &mut pass,
-                        queue,
-                        shape_buffer,
-                        shape_pipeline,
-                        screen_bind_group,
-                        rect_vertices(*rect, *color),
-                    );
-                }
-                RenderCommand::FillBrush { rect, brush, .. } => {
-                    draw_shape(
-                        &mut pass,
-                        queue,
-                        shape_buffer,
-                        shape_pipeline,
-                        screen_bind_group,
-                        brush_vertices(*rect, brush),
-                    );
-                }
-                RenderCommand::StrokeRect {
-                    rect,
-                    brush,
-                    width,
-                    radius,
-                    ..
-                } => draw_shape(
-                    &mut pass,
-                    queue,
-                    shape_buffer,
-                    shape_pipeline,
-                    screen_bind_group,
-                    stroke_vertices(*rect, brush, *width, *radius),
-                ),
-                RenderCommand::DrawSelection { rect, color, .. }
-                | RenderCommand::DrawCursor { rect, color, .. }
-                | RenderCommand::DrawComposition { rect, color, .. } => {
-                    draw_shape(
-                        &mut pass,
-                        queue,
-                        shape_buffer,
-                        shape_pipeline,
-                        screen_bind_group,
-                        rect_vertices(*rect, *color),
-                    );
+                RenderCommand::FillRect { .. }
+                | RenderCommand::FillBrush { .. }
+                | RenderCommand::StrokeRect { .. }
+                | RenderCommand::DrawSelection { .. }
+                | RenderCommand::DrawCursor { .. }
+                | RenderCommand::DrawComposition { .. } => {
+                    if let Some((buffer, vertex_count)) = &shape_buffers[command_index] {
+                        draw_shape(
+                            &mut pass,
+                            buffer,
+                            *vertex_count,
+                            shape_pipeline,
+                            screen_bind_group,
+                        );
+                    }
                 }
                 RenderCommand::DrawText {
                     rect,
@@ -847,6 +833,7 @@ impl WgpuBackend {
                     style.color,
                     *wrap,
                     *offset,
+                    scale,
                 ),
                 RenderCommand::PushClip(rect) => {
                     let logical = clips
@@ -893,9 +880,10 @@ fn draw_text<'a>(
     color: Color,
     wrap: TextWrap,
     offset: Offset,
+    scale_factor: f32,
 ) {
     let Some((width, height, pixels)) =
-        text_rasterizer.rasterize(&rect, text, font_size, color, wrap, offset)
+        text_rasterizer.rasterize(&rect, text, font_size, color, wrap, offset, scale_factor)
     else {
         return;
     };
@@ -1020,24 +1008,34 @@ fn primitive_state() -> wgpu::PrimitiveState {
 
 fn draw_shape<'a>(
     pass: &mut wgpu::RenderPass<'a>,
-    queue: &wgpu::Queue,
-    shape_buffer: &wgpu::Buffer,
+    shape_buffer: &'a wgpu::Buffer,
+    vertex_count: u32,
     shape_pipeline: &wgpu::RenderPipeline,
     screen_bind_group: &wgpu::BindGroup,
-    vertices: Vec<ShapeVertex>,
 ) {
-    if vertices.is_empty() {
-        return;
-    }
-    assert!(
-        vertices.len() <= 4096,
-        "shape command exceeds the wgpu vertex buffer capacity"
-    );
-    queue.write_buffer(shape_buffer, 0, bytemuck::cast_slice(&vertices));
     pass.set_pipeline(shape_pipeline);
     pass.set_bind_group(0, screen_bind_group, &[]);
     pass.set_vertex_buffer(0, shape_buffer.slice(..));
-    pass.draw(0..vertices.len() as u32, 0..1);
+    pass.draw(0..vertex_count, 0..1);
+}
+
+fn shape_vertices(command: &RenderCommand) -> Option<Vec<ShapeVertex>> {
+    let vertices = match command {
+        RenderCommand::FillRect { rect, color, .. } => rect_vertices(*rect, *color),
+        RenderCommand::FillBrush { rect, brush, .. } => brush_vertices(*rect, brush),
+        RenderCommand::StrokeRect {
+            rect,
+            brush,
+            width,
+            radius,
+            ..
+        } => stroke_vertices(*rect, brush, *width, *radius),
+        RenderCommand::DrawSelection { rect, color, .. }
+        | RenderCommand::DrawCursor { rect, color, .. }
+        | RenderCommand::DrawComposition { rect, color, .. } => rect_vertices(*rect, *color),
+        _ => return None,
+    };
+    (!vertices.is_empty()).then_some(vertices)
 }
 
 fn rect_vertices(rect: Rect, color: Color) -> Vec<ShapeVertex> {
@@ -1096,10 +1094,12 @@ fn stroke_vertices(rect: Rect, brush: &Brush, width: f32, radius: f32) -> Vec<Sh
     let y = rect.origin.y;
     let r = x + rect.size.width;
     let b = y + rect.size.height;
-    let radius = radius
-        .max(0.0)
-        .min(rect.size.width.min(rect.size.height) * 0.5);
-    let width = width.max(0.0);
+    let min_dimension = rect.size.width.min(rect.size.height);
+    let width = width.max(0.0).min(min_dimension * 0.5);
+    if width == 0.0 || min_dimension <= 0.0 {
+        return Vec::new();
+    }
+    let radius = radius.max(0.0).min(min_dimension * 0.5);
     if radius == 0.0 {
         return vec![
             vertex(x, y, rgba(color)),
@@ -1130,6 +1130,40 @@ fn stroke_vertices(rect: Rect, brush: &Brush, width: f32, radius: f32) -> Vec<Sh
     }
     let mut vertices = Vec::new();
     let inner = (radius - width).max(0.0);
+
+    extend_quad(
+        &mut vertices,
+        [x + radius, y],
+        [r - radius, y],
+        [r - inner, y + width],
+        [x + inner, y + width],
+        rgba(color),
+    );
+    extend_quad(
+        &mut vertices,
+        [r, y + radius],
+        [r, b - radius],
+        [r - width, b - inner],
+        [r - width, y + inner],
+        rgba(color),
+    );
+    extend_quad(
+        &mut vertices,
+        [x + radius, b],
+        [r - radius, b],
+        [r - inner, b - width],
+        [x + inner, b - width],
+        rgba(color),
+    );
+    extend_quad(
+        &mut vertices,
+        [x, b - radius],
+        [x, y + radius],
+        [x + width, y + inner],
+        [x + width, b - inner],
+        rgba(color),
+    );
+
     for (cx, cy, start) in [
         (x + radius, y + radius, std::f32::consts::PI),
         (r - radius, y + radius, 1.5 * std::f32::consts::PI),
@@ -1156,6 +1190,24 @@ fn stroke_vertices(rect: Rect, brush: &Brush, width: f32, radius: f32) -> Vec<Sh
     vertices
 }
 
+fn extend_quad(
+    vertices: &mut Vec<ShapeVertex>,
+    outer0: [f32; 2],
+    outer1: [f32; 2],
+    inner1: [f32; 2],
+    inner0: [f32; 2],
+    color: [f32; 4],
+) {
+    vertices.extend([
+        vertex(outer0[0], outer0[1], color),
+        vertex(outer1[0], outer1[1], color),
+        vertex(inner1[0], inner1[1], color),
+        vertex(outer0[0], outer0[1], color),
+        vertex(inner1[0], inner1[1], color),
+        vertex(inner0[0], inner0[1], color),
+    ]);
+}
+
 fn vertex(x: f32, y: f32, color: [f32; 4]) -> ShapeVertex {
     ShapeVertex {
         position: [x, y],
@@ -1174,11 +1226,19 @@ fn rgba(color: Color) -> [f32; 4] {
 
 fn to_wgpu_color(color: Color) -> wgpu::Color {
     wgpu::Color {
-        r: color.red as f64,
-        g: color.green as f64,
-        b: color.blue as f64,
-        a: color.alpha as f64,
+        r: color.red.clamp(0.0, 1.0) as f64,
+        g: color.green.clamp(0.0, 1.0) as f64,
+        b: color.blue.clamp(0.0, 1.0) as f64,
+        a: color.alpha.clamp(0.0, 1.0) as f64,
     }
+}
+
+fn logical_surface_size(size: PhysicalSize<u32>, scale_factor: f32) -> [f32; 2] {
+    let scale_factor = normalized_scale(scale_factor);
+    [
+        size.width as f32 / scale_factor,
+        size.height as f32 / scale_factor,
+    ]
 }
 
 fn gradient_color(stops: &[GradientStop], position: f32) -> Color {
@@ -1214,11 +1274,7 @@ fn scissor_rect(
     surface_width: u32,
     surface_height: u32,
 ) -> (u32, u32, u32, u32) {
-    let scale = if scale.is_finite() && scale > 0.0 {
-        scale
-    } else {
-        1.0
-    };
+    let scale = normalized_scale(scale);
     let viewport = Rect::new(
         0.0,
         0.0,
@@ -1227,16 +1283,16 @@ fn scissor_rect(
     );
     let rect = intersect_rect(viewport, rect);
     let x = (rect.origin.x * scale)
-        .round()
+        .floor()
         .clamp(0.0, surface_width as f32) as u32;
     let y = (rect.origin.y * scale)
-        .round()
+        .floor()
         .clamp(0.0, surface_height as f32) as u32;
     let right = ((rect.origin.x + rect.size.width) * scale)
-        .round()
+        .ceil()
         .clamp(x as f32, surface_width as f32) as u32;
     let bottom = ((rect.origin.y + rect.size.height) * scale)
-        .round()
+        .ceil()
         .clamp(y as f32, surface_height as f32) as u32;
     (x, y, right.saturating_sub(x), bottom.saturating_sub(y))
 }
@@ -1264,22 +1320,24 @@ impl TextRasterizer {
         color: Color,
         wrap: TextWrap,
         offset: Offset,
+        scale_factor: f32,
     ) -> Option<(u32, u32, Vec<u8>)> {
-        let width = rect.size.width.ceil().max(1.0) as u32;
-        let height = rect.size.height.ceil().max(1.0) as u32;
+        let scale_factor = normalized_scale(scale_factor);
+        let width = physical_text_extent(rect.size.width, scale_factor);
+        let height = physical_text_extent(rect.size.height, scale_factor);
         let mut pixels = vec![0; width as usize * height as usize * 4];
         let mut context = self.context.borrow_mut();
         let mut buffer = make_buffer(
             &mut context,
             self.family.as_deref(),
             text,
-            font_size,
+            font_size * scale_factor,
             width as f32,
             height as f32,
             wrap,
         );
-        let local_x = offset.x - rect.origin.x;
-        let local_y = offset.y - rect.origin.y;
+        let local_x = (offset.x - rect.origin.x) * scale_factor;
+        let local_y = (offset.y - rect.origin.y) * scale_factor;
         buffer.draw(
             &mut context,
             &mut self.swash_cache,
@@ -1305,6 +1363,20 @@ impl TextRasterizer {
         );
         Some((width, height, pixels))
     }
+}
+
+fn normalized_scale(scale_factor: f32) -> f32 {
+    if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    }
+}
+
+fn physical_text_extent(logical_size: f32, scale_factor: f32) -> u32 {
+    (logical_size.max(1.0) * normalized_scale(scale_factor))
+        .ceil()
+        .max(1.0) as u32
 }
 
 pub struct CosmicTextLayout {
@@ -1745,14 +1817,154 @@ mod tests {
     }
 
     #[test]
-    fn key_mapping_covers_editor_commands() {
+    fn logical_surface_size_uses_logical_coordinates() {
+        assert_eq!(
+            logical_surface_size(PhysicalSize::new(1600, 1200), 2.0),
+            [800.0, 600.0]
+        );
+        assert_eq!(
+            logical_surface_size(PhysicalSize::new(800, 600), 0.0),
+            [800.0, 600.0]
+        );
+    }
+
+    #[test]
+    fn text_rasterization_uses_physical_pixel_dimensions() {
+        assert_eq!(physical_text_extent(100.0, 1.0), 100);
+        assert_eq!(physical_text_extent(100.0, 2.0), 200);
+        assert_eq!(physical_text_extent(100.0, 1.25), 125);
+        assert_eq!(physical_text_extent(10.1, 1.5), 16);
+    }
+
+    #[test]
+    fn text_rasterization_normalizes_invalid_scale_factors() {
+        assert_eq!(normalized_scale(0.0), 1.0);
+        assert_eq!(normalized_scale(-1.0), 1.0);
+        assert_eq!(normalized_scale(f32::INFINITY), 1.0);
+        assert_eq!(normalized_scale(f32::NAN), 1.0);
+        assert_eq!(physical_text_extent(0.0, 0.0), 1);
+    }
+
+    #[test]
+    fn scissor_rect_expands_to_cover_fractional_physical_pixels() {
+        assert_eq!(
+            scissor_rect(Rect::new(10.25, 20.25, 10.25, 10.25), 2.0, 100, 100),
+            (20, 40, 21, 21),
+        );
+    }
+
+    #[test]
+    fn solid_background_generates_a_full_rectangle() {
+        let vertices = rect_vertices(Rect::new(10.0, 20.0, 30.0, 40.0), Color::WHITE);
+        assert_eq!(vertices.len(), 6);
+        assert_eq!(vertices[0].position, [10.0, 20.0]);
+        assert_eq!(vertices[2].position, [40.0, 60.0]);
+        assert!(vertices.iter().all(|vertex| vertex.color == [1.0; 4]));
+    }
+
+    #[test]
+    fn square_stroke_contains_all_four_edges() {
+        let brush = Brush::Solid(Color::BLACK);
+        let vertices = stroke_vertices(Rect::new(0.0, 0.0, 100.0, 40.0), &brush, 1.0, 0.0);
+
+        assert_eq!(vertices.len(), 24);
+        assert!(vertices.iter().any(|vertex| vertex.position == [0.0, 0.0]));
+        assert!(
+            vertices
+                .iter()
+                .any(|vertex| vertex.position == [100.0, 0.0])
+        );
+        assert!(vertices.iter().any(|vertex| vertex.position == [0.0, 40.0]));
+        assert!(
+            vertices
+                .iter()
+                .any(|vertex| vertex.position == [100.0, 40.0])
+        );
+    }
+
+    #[test]
+    fn rounded_stroke_contains_straight_edges_and_corner_arcs() {
+        let brush = Brush::Solid(Color::BLACK);
+        let vertices = stroke_vertices(Rect::new(0.0, 0.0, 100.0, 40.0), &brush, 1.0, 4.0);
+
+        assert_eq!(vertices.len(), 216);
+        assert!(vertices.iter().any(|vertex| vertex.position == [4.0, 0.0]));
+        assert!(vertices.iter().any(|vertex| vertex.position == [96.0, 0.0]));
+        assert!(vertices.iter().any(|vertex| vertex.position == [0.0, 4.0]));
+        assert!(vertices.iter().any(|vertex| vertex.position == [0.0, 36.0]));
+        assert!(vertices.iter().all(|vertex| vertex.position[0] >= 0.0
+            && vertex.position[0] <= 100.0
+            && vertex.position[1] >= 0.0
+            && vertex.position[1] <= 40.0));
+    }
+
+    #[test]
+    fn zero_width_or_empty_rect_produces_no_stroke_geometry() {
+        let brush = Brush::Solid(Color::BLACK);
+        assert!(stroke_vertices(Rect::new(0.0, 0.0, 20.0, 20.0), &brush, 0.0, 4.0).is_empty());
+        assert!(stroke_vertices(Rect::new(0.0, 0.0, 0.0, 20.0), &brush, 1.0, 4.0).is_empty());
+    }
+
+    #[test]
+    fn shape_commands_keep_independent_geometry_and_colors() {
+        let first = RenderCommand::FillRect {
+            node: karu::NodeId(1),
+            rect: Rect::new(0.0, 0.0, 10.0, 10.0),
+            color: Color::rgb(1.0, 0.0, 0.0),
+        };
+        let second = RenderCommand::FillRect {
+            node: karu::NodeId(2),
+            rect: Rect::new(20.0, 30.0, 40.0, 50.0),
+            color: Color::rgb(0.0, 1.0, 0.0),
+        };
+        let first_vertices = shape_vertices(&first).expect("first shape has vertices");
+        let second_vertices = shape_vertices(&second).expect("second shape has vertices");
+
+        assert_eq!(first_vertices[0].position, [0.0, 0.0]);
+        assert_eq!(first_vertices[0].color, [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(second_vertices[0].position, [20.0, 30.0]);
+        assert_eq!(second_vertices[0].color, [0.0, 1.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn gradient_background_generates_interpolated_corner_colors() {
+        let brush = Brush::LinearGradient {
+            start: Offset::new(0.0, 0.0),
+            end: Offset::new(100.0, 0.0),
+            stops: vec![
+                GradientStop {
+                    position: 0.0,
+                    color: Color::BLACK,
+                },
+                GradientStop {
+                    position: 1.0,
+                    color: Color::WHITE,
+                },
+            ],
+        };
+        let vertices = brush_vertices(Rect::new(0.0, 0.0, 100.0, 20.0), &brush);
+        assert_eq!(vertices.len(), 6);
+        assert_eq!(vertices[0].color, [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(vertices[1].color, [1.0; 4]);
+        assert_eq!(vertices[5].color, [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn key_mapping_separates_text_from_editor_commands() {
         assert_eq!(
             map_key(PhysicalKey::Code(WinitKeyCode::ArrowLeft)),
             Some(KeyCode::Left)
         );
+        assert_eq!(map_key(PhysicalKey::Code(WinitKeyCode::KeyV)), None);
         assert_eq!(
-            map_key(PhysicalKey::Code(WinitKeyCode::KeyV)),
-            Some(KeyCode::V)
+            map_edit_command(
+                PhysicalKey::Code(WinitKeyCode::KeyV),
+                KeyModifiers {
+                    ctrl: true,
+                    ..Default::default()
+                }
+            ),
+            Some(TextEditCommand::Paste)
         );
         assert_eq!(map_key(PhysicalKey::Code(WinitKeyCode::F1)), None);
     }
