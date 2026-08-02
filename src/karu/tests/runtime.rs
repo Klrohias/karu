@@ -1170,13 +1170,33 @@ fn basic_text_field_draws_a_cursor_and_supports_mouse_drag_selection() {
         position: Offset::new(origin.x + 16.0, origin.y + 1.0),
         primary: false,
     });
+    assert!(composition.is_dirty());
+    let dragging = composition.recompose();
+    assert_eq!(state.selected_text().as_deref(), Some("ab"));
+    assert!(
+        dragging
+            .commands
+            .iter()
+            .any(|command| matches!(command, RenderCommand::DrawSelection { .. }))
+    );
+
+    composition.dispatch_pointer_event(PointerEvent {
+        kind: PointerKind::Mouse,
+        phase: PointerPhase::Move,
+        position: Offset::new(origin.x + 24.0, origin.y + 1.0),
+        primary: false,
+    });
+    assert!(composition.is_dirty());
+    composition.recompose();
+    assert_eq!(state.selected_text().as_deref(), Some("abc"));
+
     composition.dispatch_pointer_event(PointerEvent {
         kind: PointerKind::Mouse,
         phase: PointerPhase::Up,
         position: Offset::new(origin.x + 16.0, origin.y + 1.0),
         primary: true,
     });
-    assert_eq!(state.selected_text().as_deref(), Some("ab"));
+    assert_eq!(state.selected_text().as_deref(), Some("abc"));
     let selected = composition.recompose();
     assert!(
         selected

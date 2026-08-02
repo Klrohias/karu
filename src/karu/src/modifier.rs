@@ -807,6 +807,8 @@ impl ModifierElement for TextInput {
         events.register_text_pointer_handler(node, {
             let state = state.clone();
             move |event, renderer| {
+                let previous_value = state.value();
+                let previous_active = state.active_endpoint();
                 if matches!(
                     event.event.phase,
                     crate::PointerPhase::Down | crate::PointerPhase::Move
@@ -841,6 +843,7 @@ impl ModifierElement for TextInput {
                 } else if event.event.phase == crate::PointerPhase::Up {
                     state.clear_selection_anchor();
                 }
+                state.value() != previous_value || state.active_endpoint() != previous_active
             }
         });
         events.register_text_input_handler(node, move |event, context, renderer| match event {

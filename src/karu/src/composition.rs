@@ -328,7 +328,7 @@ impl Composer {
         layout: &mut dyn TextLayoutEngine,
     ) -> bool {
         let result = self.inner.borrow_mut().events.dispatch(tree, event, layout);
-        if result.interaction_changed {
+        if result.interaction_changed || result.state_changed {
             self.inner.borrow().invalidation.mark_dirty();
         }
         result.handled

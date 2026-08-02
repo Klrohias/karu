@@ -129,10 +129,12 @@ pub struct InteractionState {
 pub(crate) struct PointerDispatchResult {
     pub handled: bool,
     pub interaction_changed: bool,
+    pub state_changed: bool,
 }
 
 type PointerCallback = Rc<RefCell<dyn FnMut(PointerEvent)>>;
-type TextPointerCallback = Rc<RefCell<dyn FnMut(TextPointerEvent, &mut dyn TextLayoutEngine)>>;
+type TextPointerCallback =
+    Rc<RefCell<dyn FnMut(TextPointerEvent, &mut dyn TextLayoutEngine) -> bool>>;
 type ClickCallback = Rc<RefCell<dyn FnMut()>>;
 type ScrollCallback = Rc<RefCell<dyn FnMut(ScrollEvent) -> bool>>;
 type TextInputCallback = Rc<
@@ -232,7 +234,7 @@ impl EventRegistry {
     pub(crate) fn register_text_pointer_handler(
         &mut self,
         node: NodeId,
-        handler: impl FnMut(TextPointerEvent, &mut dyn TextLayoutEngine) + 'static,
+        handler: impl FnMut(TextPointerEvent, &mut dyn TextLayoutEngine) -> bool + 'static,
     ) {
         self.text_pointer_handlers
             .entry(node)
@@ -285,6 +287,7 @@ impl EventRegistry {
         let mut handled = hit.is_some();
         let mut interaction_changed =
             previous.map_or(hit.is_some(), |record| record.hovered != hit);
+        let mut state_changed = false;
 
         match event.phase {
             PointerPhase::Down => {
@@ -307,7 +310,13 @@ impl EventRegistry {
                             .get(&node)
                             .is_some_and(|state| state.pressed);
                         self.set_pressed(node, true);
-                        self.invoke_text_pointer_handler(tree, node, event, was_focused, layout);
+                        state_changed |= self.invoke_text_pointer_handler(
+                            tree,
+                            node,
+                            event,
+                            was_focused,
+                            layout,
+                        );
                     }
                 }
                 handled |= self.invoke_pointer_handlers(hit, event);
@@ -326,7 +335,8 @@ impl EventRegistry {
                         .is_some_and(|state| state.pressed)
                         != pressed;
                     self.set_pressed(node, pressed);
-                    self.invoke_text_pointer_handler(tree, node, event, true, layout);
+                    state_changed |=
+                        self.invoke_text_pointer_handler(tree, node, event, true, layout);
                     handled = true;
                 }
                 handled |= self.invoke_pointer_handlers(hit, event);
@@ -341,7 +351,8 @@ impl EventRegistry {
                         .get(&node)
                         .is_some_and(|state| state.pressed);
                     self.set_pressed(node, false);
-                    self.invoke_text_pointer_handler(tree, node, event, true, layout);
+                    state_changed |=
+                        self.invoke_text_pointer_handler(tree, node, event, true, layout);
                     handled = true;
                     if event.primary
                         && hit == Some(node)
@@ -373,6 +384,7 @@ impl EventRegistry {
         PointerDispatchResult {
             handled,
             interaction_changed,
+            state_changed,
         }
     }
 
@@ -458,15 +470,15 @@ impl EventRegistry {
         event: PointerEvent,
         was_focused: bool,
         layout: &mut dyn TextLayoutEngine,
-    ) {
+    ) -> bool {
         let Some(handlers) = self.text_pointer_handlers.get(&node) else {
-            return;
+            return false;
         };
         let Some(node_layout) = tree.find(node) else {
-            return;
+            return false;
         };
         let Some(context) = text_context(tree, node) else {
-            return;
+            return false;
         };
         let text_event = TextPointerEvent {
             event,
@@ -479,9 +491,9 @@ impl EventRegistry {
             context,
             scroll_offset: node_layout.text_scroll,
         };
-        for handler in handlers {
-            (handler.borrow_mut())(text_event.clone(), layout);
-        }
+        handlers.iter().fold(false, |changed, handler| {
+            changed | (handler.borrow_mut())(text_event.clone(), layout)
+        })
     }
 
     fn invoke_pointer_handlers(&mut self, node: Option<NodeId>, event: PointerEvent) -> bool {
