@@ -1,7 +1,7 @@
 use crate::element::{ElementKind, NodeId};
 use crate::layout::{LayoutNode, Offset, Rect};
 use crate::modifier::{Brush, Color};
-use crate::{CaretAffinity, CaretPosition, Size, TextWrap};
+use crate::{CaretAffinity, CaretPosition, Clipboard, NoopClipboard, Size, TextWrap};
 use std::convert::Infallible;
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
@@ -18,22 +18,34 @@ pub struct TextStyle {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TextInputResult {
     pub handled: bool,
-    pub clipboard: Option<String>,
+    pub commands: Vec<TextInputCommand>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TextInputCommand {
+    Copy(String),
+    Cut(String),
+    PasteRequest,
 }
 
 impl TextInputResult {
     pub fn handled() -> Self {
         Self {
             handled: true,
-            clipboard: None,
+            commands: Vec::new(),
+        }
+    }
+
+    pub fn command(command: TextInputCommand) -> Self {
+        Self {
+            handled: true,
+            commands: vec![command],
         }
     }
 
     pub(crate) fn merge(&mut self, other: Self) {
         self.handled |= other.handled;
-        if other.clipboard.is_some() {
-            self.clipboard = other.clipboard;
-        }
+        self.commands.extend(other.commands);
     }
 }
 
@@ -154,12 +166,15 @@ pub trait TextLayoutEngine {
 pub trait RenderBackend {
     type Output;
     type Error;
+    type Clipboard: Clipboard;
 
     fn render(
         &mut self,
         tree: &RenderTree,
         commands: &[RenderCommand],
     ) -> Result<Self::Output, Self::Error>;
+
+    fn clipboard(&mut self) -> &mut Self::Clipboard;
 }
 
 #[derive(Clone, Debug, Default)]
@@ -172,11 +187,14 @@ pub struct HeadlessOutput {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct HeadlessBackend;
+pub struct HeadlessBackend {
+    clipboard: NoopClipboard,
+}
 
 impl RenderBackend for HeadlessBackend {
     type Output = HeadlessOutput;
     type Error = Infallible;
+    type Clipboard = NoopClipboard;
 
     fn render(
         &mut self,
@@ -187,6 +205,10 @@ impl RenderBackend for HeadlessBackend {
             tree: tree.clone(),
             commands: commands.to_vec(),
         })
+    }
+
+    fn clipboard(&mut self) -> &mut Self::Clipboard {
+        &mut self.clipboard
     }
 }
 

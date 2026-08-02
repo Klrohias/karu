@@ -1,9 +1,9 @@
 use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping, SwashCache, Wrap};
 use karu::{
-    AppBackend, AppConfig, AppRoot, Brush, CaretAffinity, CaretPosition, Color, Composition,
-    Constraints, GradientStop, KeyCode, KeyEvent, KeyModifiers, Offset, PointerEvent, PointerPhase,
-    Recomposer, Rect, RenderBackend, RenderCommand, Size, TextInputEvent, TextLayoutEngine,
-    TextWrap,
+    AppBackend, AppConfig, AppRoot, Brush, CaretAffinity, CaretPosition, Clipboard, ClipboardError,
+    Color, Composition, Constraints, GradientStop, KeyCode, KeyEvent, KeyModifiers, Offset,
+    PointerEvent, PointerPhase, Recomposer, Rect, RenderBackend, RenderCommand, Size,
+    TextInputCommand, TextInputEvent, TextLayoutEngine, TextWrap,
 };
 use macroquad::input::{
     KeyCode as QuadKeyCode, MouseButton, TouchPhase, get_char_pressed, is_key_down, is_key_pressed,
@@ -136,25 +136,28 @@ async fn run_quad(root: AppRoot, config: AppConfig, quad: ConfiguredQuad) {
                 modifiers,
                 repeat: false,
             };
-            if key == KeyCode::V && modifiers.command() {
-                suppress_character_input = true;
-                if let Some(text) = macroquad::miniquad::window::clipboard_get() {
-                    composition.dispatch_text_input_event_with(
-                        &mut text_layout,
-                        TextInputEvent::Paste {
-                            position: mouse_position,
-                            text,
-                        },
-                    );
-                }
-            } else {
-                let result = composition.dispatch_key_event_with_result_with(
-                    &mut text_layout,
-                    mouse_position,
-                    event,
-                );
-                if let Some(text) = result.clipboard {
-                    macroquad::miniquad::window::clipboard_set(&text);
+            let result = composition.dispatch_key_event_with_result_with(
+                &mut text_layout,
+                mouse_position,
+                event,
+            );
+            suppress_character_input |= result.handled;
+            for command in result.commands {
+                match command {
+                    TextInputCommand::Copy(text) | TextInputCommand::Cut(text) => {
+                        let _ = backend.clipboard().set_text(&text);
+                    }
+                    TextInputCommand::PasteRequest => {
+                        if let Ok(Some(text)) = backend.clipboard().get_text() {
+                            composition.dispatch_text_input_event_with(
+                                &mut text_layout,
+                                TextInputEvent::Paste {
+                                    position: mouse_position,
+                                    text,
+                                },
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -465,12 +468,28 @@ impl Default for CosmicTextLayout {
 
 pub struct QuadBackend {
     text_layout: CosmicTextLayout,
+    clipboard: QuadClipboard,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QuadClipboard;
+
+impl Clipboard for QuadClipboard {
+    fn get_text(&mut self) -> Result<Option<String>, ClipboardError> {
+        Ok(macroquad::miniquad::window::clipboard_get())
+    }
+
+    fn set_text(&mut self, text: &str) -> Result<(), ClipboardError> {
+        macroquad::miniquad::window::clipboard_set(text);
+        Ok(())
+    }
 }
 
 impl QuadBackend {
     pub fn new(family: Option<String>) -> Self {
         Self {
             text_layout: CosmicTextLayout::new(family),
+            clipboard: QuadClipboard,
         }
     }
 }
@@ -478,6 +497,7 @@ impl QuadBackend {
 impl RenderBackend for QuadBackend {
     type Output = ();
     type Error = std::convert::Infallible;
+    type Clipboard = QuadClipboard;
 
     fn render(
         &mut self,
@@ -489,6 +509,10 @@ impl RenderBackend for QuadBackend {
             draw_command(command, &mut self.text_layout, &mut clips);
         }
         Ok(())
+    }
+
+    fn clipboard(&mut self) -> &mut Self::Clipboard {
+        &mut self.clipboard
     }
 }
 

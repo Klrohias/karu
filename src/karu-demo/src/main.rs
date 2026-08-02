@@ -3,7 +3,7 @@ use karu::{
     TextFieldOptions, TextFieldValue, TextOptions, composable, remember_scroll_state,
     remember_text_field_state,
 };
-use karu_backend_quad::Quad;
+use karu_backend_wgpu::Wgpu;
 use karu_basic::{Button, ButtonOptions, Surface, SurfaceOptions};
 
 const CANVAS: Color = Color::rgb(0.94, 0.96, 0.98);
@@ -137,7 +137,7 @@ fn TodoApp() {
 
 fn main() {
     App::builder()
-        .with_renderer(Quad.default_system_font())
+        .with_renderer(Wgpu.default_system_font())
         .title("Karu Foundation Playground")
         .build()
         .run(TodoApp);

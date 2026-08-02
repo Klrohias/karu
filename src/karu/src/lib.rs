@@ -5,6 +5,7 @@ mod event;
 mod foundation;
 mod layout;
 mod modifier;
+mod platform;
 mod renderer;
 mod state;
 mod text_layout;
@@ -39,9 +40,11 @@ pub use modifier::{
     ModifierElement, Padding, PaintChain, PaintInput, Role, RowCrossAlignment, Scroll, ScrollAxis,
     ScrollData, SemanticRole, Semantics, TestTag, TextColor, TextInput, Weight, WeightData,
 };
+pub use platform::{Clipboard, ClipboardError, NoopClipboard};
 pub use renderer::{
     HeadlessBackend, HeadlessOutput, HeadlessTextLayout, ImageId, RenderBackend, RenderCommand,
-    RenderTree, TextInputResult, TextLayoutEngine, TextStyle, commands_for_tree_with_layout,
+    RenderTree, TextInputCommand, TextInputResult, TextLayoutEngine, TextStyle,
+    commands_for_tree_with_layout,
 };
 pub use state::{
     DerivedState, MutableState, NeverEqual, SnapshotMutationPolicy, SnapshotStateList,

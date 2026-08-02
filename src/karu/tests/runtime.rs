@@ -1,14 +1,15 @@
 #[allow(unused_imports)]
 use karu::{
     Animatable, App, AppBackend, AppConfig, Applier, Arrangement, BasicTextField, CaretPosition,
-    Color, Column, ColumnOptions, Composition, CompositionLocal, Constraints, CrossAxisAlignment,
-    Element, ElementApplier, ElementKind, FocusRequester, FocusState, HeadlessBackend,
-    HeadlessTextLayout, KeyCode, KeyEvent, KeyModifiers, LazyColumn, LazyColumnOptions, Modifier,
-    MutableState, Offset, PointerEvent, PointerKind, PointerPhase, RecomposeRequest, Recomposer,
-    Rect, RenderCommand, Row, RowOptions, ScrollEvent, ScrollState, Size, TaskHandle, TaskRuntime,
-    Text, TextFieldOptions, TextFieldState, TextInputEvent, TextLayoutEngine, TextOptions,
-    TextWrap, TweenSpec, composable, composition_local_of, disposable_effect, key,
-    mutable_state_of, provide, remember_mutable_state, side_effect,
+    Clipboard, ClipboardError, Color, Column, ColumnOptions, Composition, CompositionLocal,
+    Constraints, CrossAxisAlignment, Element, ElementApplier, ElementKind, FocusRequester,
+    FocusState, HeadlessBackend, HeadlessTextLayout, KeyCode, KeyEvent, KeyModifiers, LazyColumn,
+    LazyColumnOptions, Modifier, MutableState, Offset, PointerEvent, PointerKind, PointerPhase,
+    RecomposeRequest, Recomposer, Rect, RenderCommand, Row, RowOptions, ScrollEvent, ScrollState,
+    Size, TaskHandle, TaskRuntime, Text, TextFieldOptions, TextFieldState, TextInputCommand,
+    TextInputEvent, TextLayoutEngine, TextOptions, TextWrap, TweenSpec, composable,
+    composition_local_of, disposable_effect, key, mutable_state_of, provide,
+    remember_mutable_state, side_effect,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -129,7 +130,7 @@ fn composition_uses_renderer_text_queries_for_layout_and_commands() {
         calls: calls.clone(),
         layout: HeadlessTextLayout,
     };
-    let mut backend = HeadlessBackend;
+    let mut backend = HeadlessBackend::default();
     composition.render_with(&mut layout, &mut backend).unwrap();
     let result = composition
         .last_result()
@@ -162,6 +163,30 @@ fn public_ui_functions_build_nodes_without_macro_rewriting() {
         result.root.children[0].children[0].kind,
         ElementKind::Text(ref value) if value == "public"
     ));
+}
+
+#[derive(Default)]
+struct MemoryClipboard {
+    text: Option<String>,
+}
+
+impl Clipboard for MemoryClipboard {
+    fn get_text(&mut self) -> Result<Option<String>, ClipboardError> {
+        Ok(self.text.clone())
+    }
+
+    fn set_text(&mut self, text: &str) -> Result<(), ClipboardError> {
+        self.text = Some(text.to_string());
+        Ok(())
+    }
+}
+
+#[test]
+fn clipboard_is_a_backend_capability_with_a_testable_contract() {
+    let mut clipboard = MemoryClipboard::default();
+    assert_eq!(clipboard.get_text().unwrap(), None);
+    clipboard.set_text("copied").unwrap();
+    assert_eq!(clipboard.get_text().unwrap().as_deref(), Some("copied"));
 }
 
 #[test]
@@ -704,9 +729,12 @@ fn text_field_handles_cursor_selection_shortcuts_and_history() {
         },
         repeat: false,
     });
-    assert_eq!(copied.clipboard.as_deref(), Some("one two"));
+    assert_eq!(
+        copied.commands,
+        vec![TextInputCommand::Copy("one two".to_string())]
+    );
 
-    state.handle_key(KeyEvent {
+    let cut = state.handle_key(KeyEvent {
         code: KeyCode::X,
         modifiers: KeyModifiers {
             ctrl: true,
@@ -714,6 +742,10 @@ fn text_field_handles_cursor_selection_shortcuts_and_history() {
         },
         repeat: false,
     });
+    assert_eq!(
+        cut.commands,
+        vec![TextInputCommand::Cut("one two".to_string())]
+    );
     assert_eq!(state.text(), "");
     state.handle_key(KeyEvent {
         code: KeyCode::Z,
@@ -734,6 +766,16 @@ fn text_field_handles_cursor_selection_shortcuts_and_history() {
         repeat: false,
     });
     assert_eq!(state.text(), "");
+
+    let paste = state.handle_key(KeyEvent {
+        code: KeyCode::V,
+        modifiers: KeyModifiers {
+            ctrl: true,
+            ..Default::default()
+        },
+        repeat: false,
+    });
+    assert_eq!(paste.commands, vec![TextInputCommand::PasteRequest]);
 }
 
 #[test]

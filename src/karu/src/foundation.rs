@@ -1,4 +1,4 @@
-use crate::renderer::TextLayoutEngine;
+use crate::renderer::{TextInputCommand, TextLayoutEngine};
 use crate::text_layout::{
     TextWrap, grapheme_boundaries, next_grapheme_boundary, previous_grapheme_boundary,
 };
@@ -440,21 +440,19 @@ impl TextFieldState {
                 self.select_all();
                 TextInputResult::handled()
             }
-            (KeyCode::C, true, _) => TextInputResult {
-                handled: true,
-                clipboard: self.selected_text(),
-            },
+            (KeyCode::C, true, _) => self
+                .selected_text()
+                .map_or_else(TextInputResult::handled, |text| {
+                    TextInputResult::command(TextInputCommand::Copy(text))
+                }),
             (KeyCode::X, true, _) => {
-                let clipboard = self.selected_text();
-                if clipboard.is_some() {
-                    self.replace_selection("");
-                }
-                TextInputResult {
-                    handled: true,
-                    clipboard,
-                }
+                self.selected_text()
+                    .map_or_else(TextInputResult::handled, |text| {
+                        self.replace_selection("");
+                        TextInputResult::command(TextInputCommand::Cut(text))
+                    })
             }
-            (KeyCode::V, true, _) => TextInputResult::handled(),
+            (KeyCode::V, true, _) => TextInputResult::command(TextInputCommand::PasteRequest),
             (KeyCode::Z, true, false) => {
                 self.undo();
                 TextInputResult::handled()
