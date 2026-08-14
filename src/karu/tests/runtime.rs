@@ -1,15 +1,15 @@
 #[allow(unused_imports)]
 use karu::{
-    Animatable, App, AppBackend, AppConfig, Applier, Arrangement, BasicTextField, CaretPosition,
-    Clipboard, ClipboardError, Color, Column, ColumnOptions, Composition, CompositionLocal,
-    Constraints, CrossAxisAlignment, Element, ElementApplier, ElementKind, FocusRequester,
-    FocusState, HeadlessBackend, HeadlessTextLayout, KeyCode, KeyEvent, KeyModifiers, LazyColumn,
-    LazyColumnOptions, Modifier, MutableState, Offset, PointerEvent, PointerKind, PointerPhase,
-    RecomposeRequest, Recomposer, Rect, RenderCommand, Row, RowOptions, ScrollEvent, ScrollState,
-    Size, TaskHandle, TaskRuntime, Text, TextEditCommand, TextFieldOptions, TextFieldState,
-    TextInputCommand, TextInputEvent, TextLayoutEngine, TextOptions, TextWrap, TweenSpec,
-    composable, composition_local_of, disposable_effect, key, mutable_state_of, provide,
-    remember_mutable_state, side_effect,
+    Animatable, App, AppBackend, AppConfig, Applier, Arrangement, BasicTextField, Box, BoxOptions,
+    CaretPosition, Clipboard, ClipboardError, Color, Column, ColumnOptions, Composition,
+    CompositionLocal, Constraints, CrossAxisAlignment, Element, ElementApplier, ElementKind,
+    FocusRequester, FocusState, HeadlessBackend, HeadlessTextLayout, KeyCode, KeyEvent,
+    KeyModifiers, LazyColumn, LazyColumnOptions, Modifier, MutableState, Offset, PointerEvent,
+    PointerKind, PointerPhase, RecomposeRequest, Recomposer, Rect, RenderCommand, Row, RowOptions,
+    ScrollEvent, ScrollState, Size, TaskHandle, TaskRuntime, Text, TextEditCommand,
+    TextFieldOptions, TextFieldState, TextInputCommand, TextInputEvent, TextLayoutEngine,
+    TextOptions, TextWrap, TweenSpec, composable, composition_local_of, disposable_effect, key,
+    mutable_state_of, provide, remember_mutable_state, side_effect,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -620,6 +620,32 @@ fn key_preserves_state_when_items_reorder() {
         text_values(&text_commands(&result.commands)),
         vec!["two", "changed"]
     );
+}
+
+#[test]
+fn key_allows_conditional_branches_to_use_different_state_types() {
+    let mode = mutable_state_of(false);
+    let mut composition = {
+        let mode = mode.clone();
+        Composition::new(move || {
+            let selected = mode.get();
+            key(selected, || {
+                if selected {
+                    let value = remember_mutable_state(|| 1_u32);
+                    Text(value.get().to_string(), TextOptions::default());
+                } else {
+                    let value = remember_mutable_state(|| "idle".to_string());
+                    Text(value.get(), TextOptions::default());
+                }
+            });
+        })
+    };
+
+    composition.compose();
+    mode.set(true);
+    let result = composition.recompose();
+
+    assert_eq!(text_values(&text_commands(&result.commands)), vec!["1"]);
 }
 
 #[composable]
@@ -1457,12 +1483,284 @@ fn modifiers_affect_layout_and_render_commands() {
         })
         .expect("background modifier emits a fill command");
 
-    assert_eq!(fill.0.size.width, 100.0);
-    assert_eq!(fill.0.size.height, 14.0);
+    assert_eq!(fill.0.size.width, 96.0);
+    assert_eq!(fill.0.size.height, 10.0);
     assert_eq!(fill.1, Color::WHITE);
 
     let text = only_text_command(&result.commands);
     assert_eq!(text_value(text), "done");
+}
+
+fn first_fill(result: &karu::CompositionResult) -> (Rect, Color) {
+    result
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            RenderCommand::FillRect { rect, color, .. } => Some((*rect, *color)),
+            _ => None,
+        })
+        .expect("background command exists")
+}
+
+#[test]
+fn background_and_padding_keep_their_modifier_order() {
+    let child = || {
+        Text(
+            "x",
+            TextOptions::new().modifier(Modifier::empty().size(20.0, 10.0)),
+        );
+    };
+    let first = Composition::new(move || {
+        Box(
+            BoxOptions::new().modifier(Modifier::empty().padding(10.0).background(Color::WHITE)),
+            child,
+        );
+    })
+    .with_constraints(Constraints::loose(100.0, 100.0))
+    .compose();
+    let second = Composition::new(move || {
+        Box(
+            BoxOptions::new().modifier(Modifier::empty().background(Color::WHITE).padding(10.0)),
+            child,
+        );
+    })
+    .with_constraints(Constraints::loose(100.0, 100.0))
+    .compose();
+
+    assert_eq!(first_fill(&first).0, Rect::new(10.0, 10.0, 20.0, 10.0));
+    assert_eq!(first_fill(&second).0, Rect::new(0.0, 0.0, 40.0, 30.0));
+}
+
+#[test]
+fn ordered_paint_keeps_multiple_backgrounds_and_clip_boundaries() {
+    let result = Composition::new(|| {
+        Box(
+            BoxOptions::new().modifier(
+                Modifier::empty()
+                    .background(Color::rgb(1.0, 0.0, 0.0))
+                    .padding(2.0)
+                    .background(Color::rgb(0.0, 0.0, 1.0))
+                    .clip(),
+            ),
+            || {
+                Text(
+                    "x",
+                    TextOptions::new().modifier(Modifier::empty().size(10.0, 10.0)),
+                )
+            },
+        );
+    })
+    .with_constraints(Constraints::loose(100.0, 100.0))
+    .compose();
+
+    let fills = result
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            RenderCommand::FillRect { rect, color, .. } => Some((*rect, *color)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(fills.len(), 2);
+    assert_eq!(fills[0].0, Rect::new(0.0, 0.0, 14.0, 14.0));
+    assert_eq!(fills[1].0, Rect::new(2.0, 2.0, 10.0, 10.0));
+
+    let clip_index = result
+        .commands
+        .iter()
+        .position(|command| matches!(command, RenderCommand::PushClip { .. }))
+        .expect("clip command exists");
+    assert!(matches!(
+        result.commands[clip_index - 1],
+        RenderCommand::FillRect { .. }
+    ));
+    assert!(matches!(
+        result.commands.last(),
+        Some(RenderCommand::PopClip)
+    ));
+}
+
+#[test]
+fn border_radius_applies_to_all_node_paint_layers() {
+    let make = |modifier: Modifier| {
+        Composition::new(move || {
+            Box(BoxOptions::new().modifier(modifier.clone()), || {
+                Text(
+                    "x",
+                    TextOptions::new().modifier(Modifier::empty().size(20.0, 10.0)),
+                )
+            });
+        })
+        .with_constraints(Constraints::loose(100.0, 100.0))
+        .compose()
+    };
+    let background_then_radius = make(
+        Modifier::empty()
+            .background(Color::WHITE)
+            .border_radius(8.0),
+    );
+    let radius_then_background = make(
+        Modifier::empty()
+            .border_radius(8.0)
+            .background(Color::WHITE),
+    );
+
+    let fill_radius = |result: &karu::CompositionResult| {
+        result
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                RenderCommand::FillRect { radius, .. } => Some(*radius),
+                _ => None,
+            })
+            .expect("background command exists")
+    };
+    assert_eq!(fill_radius(&background_then_radius), 8.0);
+    assert_eq!(fill_radius(&radius_then_background), 8.0);
+}
+
+#[test]
+fn clip_hit_testing_uses_node_border_radius() {
+    let click_at_corner = |modifier: Modifier| {
+        let clicks = Rc::new(std::cell::Cell::new(0));
+        let mut composition = {
+            let clicks = clicks.clone();
+            Composition::new(move || {
+                let clicks = clicks.clone();
+                Box(
+                    BoxOptions::new().modifier(
+                        modifier
+                            .clone()
+                            .clickable(move || clicks.set(clicks.get() + 1)),
+                    ),
+                    || {
+                        Text(
+                            "x",
+                            TextOptions::new().modifier(Modifier::empty().size(20.0, 20.0)),
+                        )
+                    },
+                );
+            })
+        }
+        .with_constraints(Constraints::loose(100.0, 100.0));
+        let result = composition.compose();
+        let bounds = result.render_tree.root.children[0].bounds;
+        let point = Offset::new(bounds.origin.x + 1.0, bounds.origin.y + 1.0);
+        composition.dispatch_pointer_event(PointerEvent {
+            kind: PointerKind::Mouse,
+            phase: PointerPhase::Down,
+            position: point,
+            primary: true,
+        });
+        composition.dispatch_pointer_event(PointerEvent {
+            kind: PointerKind::Mouse,
+            phase: PointerPhase::Up,
+            position: point,
+            primary: true,
+        });
+        clicks.get()
+    };
+
+    assert_eq!(
+        click_at_corner(Modifier::empty().border_radius(8.0).clip()),
+        0
+    );
+    assert_eq!(
+        click_at_corner(Modifier::empty().clip().border_radius(8.0)),
+        0
+    );
+}
+
+#[test]
+fn layout_tolerates_zero_sized_window_constraints() {
+    let result = Composition::new(|| {
+        Box(
+            BoxOptions::new().modifier(Modifier::empty().min_size(0.0, 24.0)),
+            || Text("ready", TextOptions::new()),
+        );
+    })
+    .with_constraints(Constraints::loose(0.0, 0.0))
+    .compose();
+
+    assert_eq!(result.render_tree.root.children[0].bounds.size, Size::ZERO);
+}
+
+#[test]
+fn border_and_padding_keep_their_modifier_order() {
+    let make = |modifier: Modifier| {
+        Composition::new(move || {
+            Box(BoxOptions::new().modifier(modifier.clone()), || {
+                Text(
+                    "x",
+                    TextOptions::new().modifier(Modifier::empty().size(20.0, 10.0)),
+                )
+            });
+        })
+        .with_constraints(Constraints::loose(100.0, 100.0))
+        .compose()
+    };
+    let inner = make(Modifier::empty().padding(4.0).border(1.0, Color::BLACK));
+    let outer = make(Modifier::empty().border(1.0, Color::BLACK).padding(4.0));
+
+    let border_rect = |result: &karu::CompositionResult| {
+        result
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                RenderCommand::StrokeRect { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .expect("border command exists")
+    };
+    assert_eq!(border_rect(&inner), Rect::new(4.0, 4.0, 20.0, 10.0));
+    assert_eq!(border_rect(&outer), Rect::new(0.0, 0.0, 28.0, 18.0));
+}
+
+#[test]
+fn clickable_bounds_follow_modifier_order() {
+    let clicks = Rc::new(std::cell::Cell::new(0));
+    let mut composition = {
+        let clicks = clicks.clone();
+        Composition::new(move || {
+            let clicks = clicks.clone();
+            Box(
+                BoxOptions::new().modifier(
+                    Modifier::empty()
+                        .padding(4.0)
+                        .clickable(move || clicks.set(clicks.get() + 1)),
+                ),
+                || {
+                    Text(
+                        "x",
+                        TextOptions::new().modifier(Modifier::empty().size(20.0, 10.0)),
+                    )
+                },
+            );
+        })
+    }
+    .with_constraints(Constraints::loose(100.0, 100.0));
+    let result = composition.compose();
+    let bounds = result.render_tree.root.children[0].bounds;
+
+    assert!(!composition.dispatch_pointer_event(PointerEvent {
+        kind: PointerKind::Mouse,
+        phase: PointerPhase::Down,
+        position: Offset::new(bounds.origin.x + 1.0, bounds.origin.y + 1.0),
+        primary: true,
+    }));
+    composition.dispatch_pointer_event(PointerEvent {
+        kind: PointerKind::Mouse,
+        phase: PointerPhase::Down,
+        position: Offset::new(bounds.origin.x + 5.0, bounds.origin.y + 5.0),
+        primary: true,
+    });
+    composition.dispatch_pointer_event(PointerEvent {
+        kind: PointerKind::Mouse,
+        phase: PointerPhase::Up,
+        position: Offset::new(bounds.origin.x + 5.0, bounds.origin.y + 5.0),
+        primary: true,
+    });
+    assert_eq!(clicks.get(), 1);
 }
 
 #[composable]

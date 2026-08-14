@@ -542,7 +542,12 @@ fn text_context(tree: &LayoutNode, node: NodeId) -> Option<TextInputContext> {
 }
 
 fn hit_test(node: &LayoutNode, position: Offset) -> Option<NodeId> {
-    if !node.bounds.contains(position) {
+    if !node.bounds.contains(position)
+        || node
+            .clip_regions
+            .iter()
+            .any(|clip| !contains_clip(clip, position))
+    {
         return None;
     }
 
@@ -552,7 +557,13 @@ fn hit_test(node: &LayoutNode, position: Offset) -> Option<NodeId> {
         }
     }
 
-    if node.interactive {
+    if node.interactive
+        && (node.interaction_bounds.is_empty()
+            || node
+                .interaction_bounds
+                .iter()
+                .any(|bounds| bounds.contains(position)))
+    {
         Some(node.id)
     } else {
         None
@@ -560,10 +571,21 @@ fn hit_test(node: &LayoutNode, position: Offset) -> Option<NodeId> {
 }
 
 fn hit_path(node: &LayoutNode, position: Offset, path: &mut Vec<NodeId>) -> bool {
-    if !node.bounds.contains(position) {
+    if !node.bounds.contains(position)
+        || node
+            .clip_regions
+            .iter()
+            .any(|clip| !contains_clip(clip, position))
+    {
         return false;
     }
-    if node.interactive {
+    if node.interactive
+        && (node.interaction_bounds.is_empty()
+            || node
+                .interaction_bounds
+                .iter()
+                .any(|bounds| bounds.contains(position)))
+    {
         path.push(node.id);
     }
     for child in node.children.iter().rev() {
@@ -572,4 +594,26 @@ fn hit_path(node: &LayoutNode, position: Offset, path: &mut Vec<NodeId>) -> bool
         }
     }
     true
+}
+
+fn contains_clip(clip: &crate::layout::ClipRegion, position: Offset) -> bool {
+    if !clip.rect.contains(position) {
+        return false;
+    }
+    let radius = clip
+        .radius
+        .max(0.0)
+        .min(clip.rect.size.width.min(clip.rect.size.height) * 0.5);
+    if radius == 0.0 {
+        return true;
+    }
+    let local_x = position.x - clip.rect.origin.x;
+    let local_y = position.y - clip.rect.origin.y;
+    let dx = (radius - local_x)
+        .max(0.0)
+        .max(local_x - (clip.rect.size.width - radius));
+    let dy = (radius - local_y)
+        .max(0.0)
+        .max(local_y - (clip.rect.size.height - radius));
+    dx * dx + dy * dy <= radius * radius
 }

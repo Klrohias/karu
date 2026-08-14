@@ -47,7 +47,10 @@ impl ButtonOptions {
 }
 
 pub mod style {
-    use karu::{Brush, Color, InteractionState, Modifier, ModifierData, ModifierElement};
+    use karu::{
+        Brush, Color, InteractionState, Modifier, ModifierData, ModifierElement, PaintChain,
+        PaintInput, RenderCommand,
+    };
     use std::any::Any;
 
     pub const PRIMARY: Color = Color::rgb(0.12, 0.36, 0.86);
@@ -74,6 +77,23 @@ pub mod style {
             data.background_brush = Some(Brush::Solid(color));
         }
 
+        fn paint(&self, input: PaintInput<'_>, next: &mut dyn PaintChain) {
+            let color = if input.interaction.pressed {
+                PRIMARY_PRESSED
+            } else if input.interaction.hovered {
+                PRIMARY_HOVER
+            } else {
+                PRIMARY
+            };
+            input.commands.push(RenderCommand::FillRect {
+                node: input.node,
+                rect: input.bounds,
+                color,
+                radius: input.radius,
+            });
+            next.paint(input);
+        }
+
         fn as_any(&self) -> &dyn Any {
             self
         }
@@ -82,11 +102,10 @@ pub mod style {
     pub fn button(modifier: Modifier) -> Modifier {
         Modifier::empty()
             .min_size(64.0, 20.0)
-            .padding(8.0)
-            .then(ButtonBackground)
-            .border(1.0, Color::rgb(0.06, 0.20, 0.55))
             .border_radius(4.0)
             .clip()
+            .then(ButtonBackground)
+            .border(1.0, Color::rgb(0.06, 0.20, 0.55))
             .then_modifier(modifier)
     }
 }
@@ -96,9 +115,9 @@ pub mod style {
 pub fn Button(on_click: impl FnMut() + 'static, options: ButtonOptions, content: impl FnMut()) {
     let modifier = style::button(options.modifier).role(Role::Button);
     let modifier = if options.enabled {
-        modifier.clickable(on_click)
+        modifier.clickable(on_click).padding(8.0)
     } else {
-        modifier.disabled()
+        modifier.disabled().padding(8.0)
     };
     Box(BoxOptions::new().modifier(modifier), content);
 }

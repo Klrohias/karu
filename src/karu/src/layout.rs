@@ -2,8 +2,8 @@ use crate::TextFieldValue;
 use crate::element::{Element, ElementKind, NodeId};
 use crate::event::{EventRegistry, InteractionState};
 use crate::modifier::{
-    Alignment, Arrangement, BorderData, Brush, Color, CrossAxisAlignment, ModifierData, ScrollAxis,
-    ScrollData, Semantics,
+    Alignment, Arrangement, BorderData, Brush, Color, CrossAxisAlignment, Modifier, Padding,
+    ScrollAxis, ScrollData, Semantics,
 };
 use crate::renderer::TextLayoutEngine;
 use crate::text_layout::TextWrap;
@@ -104,11 +104,31 @@ impl Constraints {
     }
 
     pub fn constrain(&self, size: Size) -> Size {
+        let normalized = self.normalized();
         Size {
-            width: size.width.clamp(self.min_width, self.max_width),
-            height: size.height.clamp(self.min_height, self.max_height),
+            width: size.width.clamp(normalized.min_width, normalized.max_width),
+            height: size
+                .height
+                .clamp(normalized.min_height, normalized.max_height),
         }
     }
+
+    pub(crate) fn normalized(self) -> Self {
+        let (min_width, max_width) = normalize_axis(self.min_width, self.max_width);
+        let (min_height, max_height) = normalize_axis(self.min_height, self.max_height);
+        Self {
+            min_width,
+            max_width,
+            min_height,
+            max_height,
+        }
+    }
+}
+
+fn normalize_axis(min: f32, max: f32) -> (f32, f32) {
+    let min = if min.is_nan() { 0.0 } else { min };
+    let max = if max.is_nan() { min } else { max };
+    if min > max { (max, max) } else { (min, max) }
 }
 
 impl Default for Constraints {
@@ -144,6 +164,16 @@ pub struct LayoutNode {
     pub scroll: Option<ScrollData>,
     pub scroll_offset: f32,
     pub children: Vec<LayoutNode>,
+    pub(crate) modifier: Modifier,
+    pub(crate) modifier_bounds: Vec<Rect>,
+    pub(crate) interaction_bounds: Vec<Rect>,
+    pub(crate) clip_regions: Vec<ClipRegion>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ClipRegion {
+    pub rect: Rect,
+    pub radius: f32,
 }
 
 impl LayoutNode {
@@ -208,44 +238,12 @@ fn layout_element(
     interactions: &dyn Fn(NodeId) -> InteractionState,
     layout: &mut dyn TextLayoutEngine,
 ) -> LayoutNode {
+    let constraints = constraints.normalized();
     let interaction = interactions(element.id);
     let data = element.modifier.data_for(interaction);
-    let child_constraints = Constraints {
-        min_width: 0.0,
-        max_width: (constraints.max_width - data.padding.horizontal()).max(0.0),
-        min_height: 0.0,
-        max_height: (constraints.max_height - data.padding.vertical()).max(0.0),
-    };
-
     let child_origin = Offset::new(origin.x + data.padding.left, origin.y + data.padding.top);
 
-    let layout_constraints = if data.width.is_some() || data.height.is_some() {
-        Constraints {
-            max_width: data
-                .width
-                .map(|width| (width - data.padding.horizontal()).max(0.0))
-                .unwrap_or(child_constraints.max_width),
-            max_height: data
-                .height
-                .map(|height| (height - data.padding.vertical()).max(0.0))
-                .unwrap_or(child_constraints.max_height),
-            ..child_constraints
-        }
-    } else {
-        child_constraints
-    };
-
-    let content_constraints = match data.scroll.as_ref().map(|scroll| scroll.axis) {
-        Some(ScrollAxis::Horizontal) => Constraints {
-            max_width: f32::INFINITY,
-            ..layout_constraints
-        },
-        Some(ScrollAxis::Vertical) => Constraints {
-            max_height: f32::INFINITY,
-            ..layout_constraints
-        },
-        None => layout_constraints,
-    };
+    let content_constraints = element.modifier.content_constraints(constraints);
 
     let mut children = match element.kind {
         ElementKind::Root | ElementKind::Column | ElementKind::Component(_) => {
@@ -278,7 +276,7 @@ fn layout_element(
 
     let text_size = match &element.kind {
         ElementKind::Text(text) => {
-            let max_width = layout_constraints.max_width;
+            let max_width = content_constraints.max_width;
             let mut text_size = layout.measure_text(
                 text,
                 data.font_size.unwrap_or(14.0),
@@ -298,7 +296,7 @@ fn layout_element(
         _ => None,
     };
     let content_size = intrinsic_size(element, &children, text_size);
-    let size = apply_modifier_size(&data, content_size, constraints);
+    let size = element.modifier.measure_content(constraints, content_size);
 
     let text_scroll =
         if let (Some(text_size), Some(state)) = (text_size, element.modifier.text_field_state()) {
@@ -381,10 +379,17 @@ fn layout_element(
         (size.height - data.padding.vertical()).max(0.0),
     );
 
+    let bounds = element
+        .modifier
+        .layout_bounds(element.id, Rect { origin, size });
+    let modifier_bounds = modifier_bounds(&element.modifier, bounds);
+    let interaction_bounds = interaction_bounds(&element.modifier, &modifier_bounds);
+    let clip_regions = clip_regions(&element.modifier, &modifier_bounds, data.border_radius);
+
     LayoutNode {
         id: element.id,
         kind: element.kind.clone(),
-        bounds: Rect { origin, size },
+        bounds,
         background: data.background,
         background_brush: data.background_brush,
         text_color: data.text_color,
@@ -411,7 +416,70 @@ fn layout_element(
         scroll: scroll_data,
         scroll_offset,
         children,
+        modifier: element.modifier.clone(),
+        modifier_bounds,
+        interaction_bounds,
+        clip_regions,
     }
+}
+
+fn inset_rect(rect: Rect, left: f32, top: f32, right: f32, bottom: f32) -> Rect {
+    Rect::new(
+        rect.origin.x + left,
+        rect.origin.y + top,
+        (rect.size.width - left - right).max(0.0),
+        (rect.size.height - top - bottom).max(0.0),
+    )
+}
+
+fn modifier_bounds(modifier: &Modifier, bounds: Rect) -> Vec<Rect> {
+    let mut insets = crate::modifier::EdgeInsets::default();
+    let mut result = Vec::with_capacity(modifier.len());
+    for element in modifier.elements() {
+        result.push(inset_rect(
+            bounds,
+            insets.left,
+            insets.top,
+            insets.right,
+            insets.bottom,
+        ));
+        if let Some(padding) = element.as_any().downcast_ref::<Padding>() {
+            insets.left += padding.left;
+            insets.top += padding.top;
+            insets.right += padding.right;
+            insets.bottom += padding.bottom;
+        }
+    }
+    result
+}
+
+fn interaction_bounds(modifier: &Modifier, bounds: &[Rect]) -> Vec<Rect> {
+    modifier
+        .elements()
+        .iter()
+        .zip(bounds)
+        .filter_map(|(element, bounds)| {
+            (element.as_any().is::<crate::modifier::Clickable>()
+                || element.as_any().is::<crate::modifier::PointerInput>()
+                || element.as_any().is::<crate::modifier::TextInput>()
+                || element.as_any().is::<crate::modifier::FocusTarget>()
+                || element.as_any().is::<crate::modifier::Scroll>())
+            .then_some(*bounds)
+        })
+        .collect()
+}
+
+fn clip_regions(modifier: &Modifier, bounds: &[Rect], radius: f32) -> Vec<ClipRegion> {
+    let mut regions = Vec::new();
+    for (element, bounds) in modifier.elements().iter().zip(bounds) {
+        if element.as_any().is::<crate::modifier::Clip>() {
+            regions.push(ClipRegion {
+                rect: *bounds,
+                radius,
+            });
+        }
+    }
+    regions
 }
 
 fn layout_vertical_children(
@@ -469,7 +537,7 @@ fn layout_weighted_children(
 ) -> Vec<LayoutNode> {
     let weights = children
         .iter()
-        .map(|child| child.modifier.data().weight)
+        .map(|child| child.modifier.data_for(interactions(child.id)).weight)
         .collect::<Vec<_>>();
     let total_weight = weights
         .iter()
@@ -583,6 +651,18 @@ pub(crate) fn translate_node(node: &mut LayoutNode, dx: f32, dy: f32) {
     node.text_origin.y += dy;
     node.text_viewport.origin.x += dx;
     node.text_viewport.origin.y += dy;
+    for bounds in &mut node.modifier_bounds {
+        bounds.origin.x += dx;
+        bounds.origin.y += dy;
+    }
+    for bounds in &mut node.interaction_bounds {
+        bounds.origin.x += dx;
+        bounds.origin.y += dy;
+    }
+    for clip in &mut node.clip_regions {
+        clip.rect.origin.x += dx;
+        clip.rect.origin.y += dy;
+    }
     for child in &mut node.children {
         translate_node(child, dx, dy);
     }
@@ -671,38 +751,6 @@ fn intrinsic_size(element: &Element, children: &[LayoutNode], text_size: Option<
             Size::new(width, height)
         }
     }
-}
-
-fn apply_modifier_size(data: &ModifierData, content_size: Size, constraints: Constraints) -> Size {
-    let mut size = content_size;
-
-    if data.fill_max_width && constraints.max_width.is_finite() {
-        size.width = constraints.max_width;
-    }
-
-    if data.fill_max_height && constraints.max_height.is_finite() {
-        size.height = constraints.max_height;
-    }
-
-    if let Some(width) = data.width {
-        size.width = width;
-    }
-
-    if let Some(height) = data.height {
-        size.height = height;
-    }
-
-    if let Some(width) = data.min_width {
-        size.width = size.width.max(width);
-    }
-
-    if let Some(height) = data.min_height {
-        size.height = size.height.max(height);
-    }
-
-    size.width += data.padding.horizontal();
-    size.height += data.padding.vertical();
-    constraints.constrain(size)
 }
 
 fn child_alignment(element: &Element, child: &LayoutNode, default: Alignment) -> Alignment {

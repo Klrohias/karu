@@ -335,48 +335,27 @@ fn push_commands(
     commands: &mut Vec<RenderCommand>,
     layout: &mut dyn TextLayoutEngine,
 ) {
-    if node.clip {
-        commands.push(RenderCommand::PushClip {
-            node: node.id,
-            rect: node.bounds,
-            radius: node.border_radius,
-        });
-    }
+    let mut terminal = |_: NodeId,
+                        _: Rect,
+                        _: crate::event::InteractionState,
+                        commands: &mut Vec<RenderCommand>| {
+        push_content_commands(node, commands, layout);
+    };
+    node.modifier.paint_ordered(
+        node.id,
+        &node.modifier_bounds,
+        node.interaction,
+        node.border_radius,
+        commands,
+        &mut terminal,
+    );
+}
 
-    if let Some(brush) = &node.background_brush {
-        match brush {
-            Brush::Solid(color) => commands.push(RenderCommand::FillRect {
-                node: node.id,
-                rect: node.bounds,
-                color: *color,
-                radius: node.border_radius,
-            }),
-            _ => commands.push(RenderCommand::FillBrush {
-                node: node.id,
-                rect: node.bounds,
-                brush: brush.clone(),
-                radius: node.border_radius,
-            }),
-        }
-    } else if let Some(color) = node.background {
-        commands.push(RenderCommand::FillRect {
-            node: node.id,
-            rect: node.bounds,
-            color,
-            radius: node.border_radius,
-        });
-    }
-
-    if let Some(border) = &node.border {
-        commands.push(RenderCommand::StrokeRect {
-            node: node.id,
-            rect: node.bounds,
-            brush: border.brush.clone(),
-            width: border.width,
-            radius: node.border_radius,
-        });
-    }
-
+fn push_content_commands(
+    node: &LayoutNode,
+    commands: &mut Vec<RenderCommand>,
+    layout: &mut dyn TextLayoutEngine,
+) {
     if let ElementKind::Text(text) = &node.kind {
         let font_size = node.font_size.unwrap_or(14.0);
         let max_width = node.text_viewport.size.width;

@@ -9,6 +9,7 @@ use crate::{FocusRequester, FocusState, TextInputResult};
 use std::any::Any;
 use std::cell::RefCell;
 use std::fmt;
+use std::marker::PhantomData;
 use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -295,10 +296,97 @@ pub struct PaintInput<'a> {
     pub node: NodeId,
     pub bounds: Rect,
     pub commands: &'a mut Vec<RenderCommand>,
+    pub interaction: InteractionState,
+    pub radius: f32,
 }
 
 pub trait PaintChain {
     fn paint(&mut self, input: PaintInput<'_>);
+}
+
+type PaintTerminal<'a> = dyn FnMut(NodeId, Rect, InteractionState, &mut Vec<RenderCommand>) + 'a;
+
+struct ModifierMeasureChain<'a> {
+    elements: &'a [Rc<dyn ModifierElement>],
+    index: usize,
+}
+
+struct ModifierLayoutChain<'a> {
+    elements: &'a [Rc<dyn ModifierElement>],
+    index: usize,
+}
+
+impl LayoutChain for ModifierLayoutChain<'_> {
+    fn layout(&mut self, input: LayoutInput) -> LayoutOutput {
+        let Some(element) = self.elements.get(self.index) else {
+            return LayoutOutput {
+                bounds: input.bounds,
+            };
+        };
+        let mut next = Self {
+            elements: self.elements,
+            index: self.index + 1,
+        };
+        element.layout(input, &mut next)
+    }
+}
+
+impl MeasureChain for ModifierMeasureChain<'_> {
+    fn measure(&mut self, input: MeasureInput) -> MeasureOutput {
+        let input = MeasureInput {
+            constraints: input.constraints.normalized(),
+            ..input
+        };
+        let Some(element) = self.elements.get(self.index) else {
+            return MeasureOutput {
+                size: input.constraints.constrain(input.content_size),
+            };
+        };
+        let mut next = Self {
+            elements: self.elements,
+            index: self.index + 1,
+        };
+        element.measure(input, &mut next)
+    }
+}
+
+struct ModifierPaintChain<'a, 'b> {
+    elements: &'a [Rc<dyn ModifierElement>],
+    bounds: &'a [Rect],
+    index: usize,
+    terminal: *mut PaintTerminal<'b>,
+    _terminal: PhantomData<&'b mut ()>,
+}
+
+impl PaintChain for ModifierPaintChain<'_, '_> {
+    fn paint(&mut self, input: PaintInput<'_>) {
+        let Some(element) = self.elements.get(self.index) else {
+            // The chain is strictly nested, so the terminal callback has one
+            // active mutable borrow at a time while this pointer is used.
+            unsafe {
+                (&mut *self.terminal)(input.node, input.bounds, input.interaction, input.commands);
+            }
+            return;
+        };
+        let bounds = self.bounds.get(self.index).copied().unwrap_or(input.bounds);
+        let mut next = Self {
+            elements: self.elements,
+            bounds: self.bounds,
+            index: self.index + 1,
+            terminal: self.terminal,
+            _terminal: PhantomData,
+        };
+        element.paint(
+            PaintInput {
+                node: input.node,
+                bounds,
+                commands: input.commands,
+                interaction: input.interaction,
+                radius: input.radius,
+            },
+            &mut next,
+        );
+    }
 }
 
 #[derive(Clone, Default)]
@@ -493,6 +581,106 @@ impl Modifier {
         data
     }
 
+    pub(crate) fn elements(&self) -> &[Rc<dyn ModifierElement>] {
+        &self.elements
+    }
+
+    pub(crate) fn measure_content(&self, constraints: Constraints, content_size: Size) -> Size {
+        let mut chain = ModifierMeasureChain {
+            elements: &self.elements,
+            index: 0,
+        };
+        chain
+            .measure(MeasureInput {
+                constraints,
+                content_size,
+            })
+            .size
+    }
+
+    pub(crate) fn layout_bounds(&self, node: NodeId, bounds: Rect) -> Rect {
+        let mut chain = ModifierLayoutChain {
+            elements: &self.elements,
+            index: 0,
+        };
+        chain.layout(LayoutInput { node, bounds }).bounds
+    }
+
+    pub(crate) fn content_constraints(&self, constraints: Constraints) -> Constraints {
+        let mut current = constraints.normalized();
+        for element in self.elements.iter() {
+            current = current.normalized();
+            if let Some(padding) = element.as_any().downcast_ref::<Padding>() {
+                current = Constraints {
+                    min_width: (current.min_width - padding.left - padding.right).max(0.0),
+                    max_width: (current.max_width - padding.left - padding.right).max(0.0),
+                    min_height: (current.min_height - padding.top - padding.bottom).max(0.0),
+                    max_height: (current.max_height - padding.top - padding.bottom).max(0.0),
+                };
+            } else if let Some(size) = element.as_any().downcast_ref::<FixedSize>() {
+                let target = current.constrain(Size::new(size.width, size.height));
+                current = Constraints {
+                    min_width: 0.0,
+                    max_width: target.width,
+                    min_height: 0.0,
+                    max_height: target.height,
+                };
+            } else if let Some(width) = element.as_any().downcast_ref::<FixedWidth>() {
+                let width = width.0.clamp(current.min_width, current.max_width);
+                current.min_width = 0.0;
+                current.max_width = width;
+            } else if let Some(height) = element.as_any().downcast_ref::<FixedHeight>() {
+                let height = height.0.clamp(current.min_height, current.max_height);
+                current.min_height = 0.0;
+                current.max_height = height;
+            } else if element.as_any().is::<MinSize>() {
+                current.min_width = 0.0;
+                current.min_height = 0.0;
+            } else if element.as_any().is::<FillMaxWidth>() && current.max_width.is_finite() {
+                current.min_width = 0.0;
+            } else if element.as_any().is::<FillMaxHeight>() && current.max_height.is_finite() {
+                current.min_height = 0.0;
+            } else if let Some(scroll) = element.as_any().downcast_ref::<Scroll>() {
+                match scroll.axis {
+                    ScrollAxis::Horizontal => {
+                        current.min_width = 0.0;
+                        current.max_width = f32::INFINITY;
+                    }
+                    ScrollAxis::Vertical => {
+                        current.min_height = 0.0;
+                        current.max_height = f32::INFINITY;
+                    }
+                }
+            }
+        }
+        current.normalized()
+    }
+
+    pub(crate) fn paint_ordered(
+        &self,
+        node: NodeId,
+        bounds: &[Rect],
+        interaction: InteractionState,
+        radius: f32,
+        commands: &mut Vec<RenderCommand>,
+        terminal: &mut PaintTerminal<'_>,
+    ) {
+        let mut chain = ModifierPaintChain {
+            elements: &self.elements,
+            bounds,
+            index: 0,
+            terminal: terminal as *mut _,
+            _terminal: PhantomData,
+        };
+        chain.paint(PaintInput {
+            node,
+            bounds: bounds.first().copied().unwrap_or(Rect::default()),
+            commands,
+            interaction,
+            radius,
+        });
+    }
+
     pub(crate) fn install_events(&self, node: NodeId, events: &mut EventRegistry) {
         for element in self.elements.iter() {
             element.install(node, events);
@@ -533,6 +721,12 @@ impl fmt::Debug for Modifier {
 impl PartialEq for Modifier {
     fn eq(&self, other: &Self) -> bool {
         self.data() == other.data()
+            && self.elements.len() == other.elements.len()
+            && self
+                .elements
+                .iter()
+                .zip(other.elements.iter())
+                .all(|(left, right)| left.as_any().type_id() == right.as_any().type_id())
     }
 }
 
@@ -564,6 +758,25 @@ impl ModifierElement for Padding {
         data.padding.bottom += self.bottom;
     }
 
+    fn measure(&self, input: MeasureInput, next: &mut dyn MeasureChain) -> MeasureOutput {
+        let constraints = Constraints {
+            min_width: (input.constraints.min_width - self.left - self.right).max(0.0),
+            max_width: (input.constraints.max_width - self.left - self.right).max(0.0),
+            min_height: (input.constraints.min_height - self.top - self.bottom).max(0.0),
+            max_height: (input.constraints.max_height - self.top - self.bottom).max(0.0),
+        };
+        let child = next.measure(MeasureInput {
+            constraints,
+            content_size: input.content_size,
+        });
+        MeasureOutput {
+            size: input.constraints.constrain(Size::new(
+                child.size.width + self.left + self.right,
+                child.size.height + self.top + self.bottom,
+            )),
+        }
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -579,6 +792,17 @@ impl ModifierElement for FixedSize {
         data.width = Some(self.width);
         data.height = Some(self.height);
     }
+
+    fn measure(&self, input: MeasureInput, next: &mut dyn MeasureChain) -> MeasureOutput {
+        let size = input
+            .constraints
+            .constrain(Size::new(self.width, self.height));
+        let _ = next.measure(MeasureInput {
+            constraints: Constraints::tight(size),
+            content_size: input.content_size,
+        });
+        MeasureOutput { size }
+    }
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -590,6 +814,21 @@ impl ModifierElement for FixedWidth {
     fn apply(&self, data: &mut ModifierData) {
         data.width = Some(self.0);
     }
+
+    fn measure(&self, input: MeasureInput, next: &mut dyn MeasureChain) -> MeasureOutput {
+        let width = input.constraints.constrain(Size::new(self.0, 0.0)).width;
+        let child = next.measure(MeasureInput {
+            constraints: Constraints {
+                min_width: width,
+                max_width: width,
+                ..input.constraints
+            },
+            content_size: input.content_size,
+        });
+        MeasureOutput {
+            size: Size::new(width, child.size.height),
+        }
+    }
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -600,6 +839,21 @@ pub struct FixedHeight(pub f32);
 impl ModifierElement for FixedHeight {
     fn apply(&self, data: &mut ModifierData) {
         data.height = Some(self.0);
+    }
+
+    fn measure(&self, input: MeasureInput, next: &mut dyn MeasureChain) -> MeasureOutput {
+        let height = input.constraints.constrain(Size::new(0.0, self.0)).height;
+        let child = next.measure(MeasureInput {
+            constraints: Constraints {
+                min_height: height,
+                max_height: height,
+                ..input.constraints
+            },
+            content_size: input.content_size,
+        });
+        MeasureOutput {
+            size: Size::new(child.size.width, height),
+        }
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -616,6 +870,23 @@ impl ModifierElement for MinSize {
         data.min_width = Some(self.width);
         data.min_height = Some(self.height);
     }
+
+    fn measure(&self, input: MeasureInput, next: &mut dyn MeasureChain) -> MeasureOutput {
+        let child = next.measure(MeasureInput {
+            constraints: Constraints {
+                min_width: input.constraints.min_width.max(self.width),
+                min_height: input.constraints.min_height.max(self.height),
+                ..input.constraints
+            },
+            content_size: input.content_size,
+        });
+        MeasureOutput {
+            size: input.constraints.constrain(Size::new(
+                child.size.width.max(self.width),
+                child.size.height.max(self.height),
+            )),
+        }
+    }
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -627,6 +898,24 @@ impl ModifierElement for FillMaxWidth {
     fn apply(&self, data: &mut ModifierData) {
         data.fill_max_width = true;
     }
+
+    fn measure(&self, input: MeasureInput, next: &mut dyn MeasureChain) -> MeasureOutput {
+        if !input.constraints.max_width.is_finite() {
+            return next.measure(input);
+        }
+        let width = input.constraints.max_width;
+        let child = next.measure(MeasureInput {
+            constraints: Constraints {
+                min_width: width,
+                max_width: width,
+                ..input.constraints
+            },
+            content_size: input.content_size,
+        });
+        MeasureOutput {
+            size: Size::new(width, child.size.height),
+        }
+    }
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -637,6 +926,24 @@ pub struct FillMaxHeight;
 impl ModifierElement for FillMaxHeight {
     fn apply(&self, data: &mut ModifierData) {
         data.fill_max_height = true;
+    }
+
+    fn measure(&self, input: MeasureInput, next: &mut dyn MeasureChain) -> MeasureOutput {
+        if !input.constraints.max_height.is_finite() {
+            return next.measure(input);
+        }
+        let height = input.constraints.max_height;
+        let child = next.measure(MeasureInput {
+            constraints: Constraints {
+                min_height: height,
+                max_height: height,
+                ..input.constraints
+            },
+            content_size: input.content_size,
+        });
+        MeasureOutput {
+            size: Size::new(child.size.width, height),
+        }
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -956,6 +1263,24 @@ impl ModifierElement for Background {
         };
         data.background_brush = Some(self.0.clone());
     }
+
+    fn paint(&self, input: PaintInput<'_>, next: &mut dyn PaintChain) {
+        match &self.0 {
+            Brush::Solid(color) => input.commands.push(RenderCommand::FillRect {
+                node: input.node,
+                rect: input.bounds,
+                color: *color,
+                radius: input.radius,
+            }),
+            brush => input.commands.push(RenderCommand::FillBrush {
+                node: input.node,
+                rect: input.bounds,
+                brush: brush.clone(),
+                radius: input.radius,
+            }),
+        }
+        next.paint(input);
+    }
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -995,6 +1320,23 @@ impl ModifierElement for Border {
             brush: self.brush.clone(),
         });
     }
+
+    fn paint(&self, input: PaintInput<'_>, next: &mut dyn PaintChain) {
+        next.paint(PaintInput {
+            node: input.node,
+            bounds: input.bounds,
+            commands: input.commands,
+            interaction: input.interaction,
+            radius: input.radius,
+        });
+        input.commands.push(RenderCommand::StrokeRect {
+            node: input.node,
+            rect: input.bounds,
+            brush: self.brush.clone(),
+            width: self.width,
+            radius: input.radius,
+        });
+    }
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -1006,6 +1348,11 @@ impl ModifierElement for BorderRadius {
     fn apply(&self, data: &mut ModifierData) {
         data.border_radius = self.0;
     }
+
+    fn paint(&self, mut input: PaintInput<'_>, next: &mut dyn PaintChain) {
+        input.radius = self.0;
+        next.paint(input);
+    }
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -1016,6 +1363,27 @@ pub struct Clip;
 impl ModifierElement for Clip {
     fn apply(&self, data: &mut ModifierData) {
         data.clip = true;
+    }
+
+    fn paint(&self, input: PaintInput<'_>, next: &mut dyn PaintChain) {
+        let node = input.node;
+        let bounds = input.bounds;
+        let interaction = input.interaction;
+        let radius = input.radius;
+        let commands = input.commands;
+        commands.push(RenderCommand::PushClip {
+            node,
+            rect: bounds,
+            radius,
+        });
+        next.paint(PaintInput {
+            node,
+            bounds,
+            commands: &mut *commands,
+            interaction,
+            radius,
+        });
+        commands.push(RenderCommand::PopClip);
     }
     fn as_any(&self) -> &dyn Any {
         self
