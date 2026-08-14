@@ -2,6 +2,7 @@ use crate::app::*;
 use crate::config::*;
 use crate::geometry::*;
 use crate::input::*;
+use crate::renderer::*;
 use crate::text::*;
 use karu::{
     AppConfig, Brush, Color, GradientStop, KeyCode, KeyModifiers, Offset, Rect, RenderCommand,
@@ -142,6 +143,21 @@ fn rounded_background_generates_corner_geometry() {
             && vertex.position[1] >= 0.0
             && vertex.position[1] <= 40.0
     }));
+}
+
+#[test]
+fn rounded_corner_segments_scale_with_radius() {
+    assert_eq!(rounded_corner_segments(4.0), 8);
+    assert!(rounded_corner_segments(100.0) > rounded_corner_segments(8.0));
+    assert_eq!(rounded_corner_segments(10_000.0), 24);
+}
+
+#[test]
+fn msaa_prefers_four_samples_and_falls_back_to_one() {
+    assert_eq!(select_msaa_sample_count(&[1, 2, 4, 8], true), 4);
+    assert_eq!(select_msaa_sample_count(&[1, 2, 4, 8], false), 1);
+    assert_eq!(select_msaa_sample_count(&[1, 2], true), 1);
+    assert_eq!(select_msaa_sample_count(&[], true), 1);
 }
 
 #[test]

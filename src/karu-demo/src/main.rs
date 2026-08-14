@@ -835,16 +835,22 @@ fn Console() {
                         || {
                             Sidebar(screen.clone(), &tasks_snapshot);
                             Spacer(SpacerOptions::new().modifier(Modifier::empty().width(14.0)));
-                            key(selected as u8, || match selected {
-                                Screen::Overview => Overview(
-                                    tasks.clone(),
-                                    next_id.clone(),
-                                    filter.clone(),
-                                    list_scroll.clone(),
-                                ),
-                                Screen::StateLab => StateLab(note.clone(), counter.clone()),
-                                Screen::ModifierLab => ModifierLab(),
-                            });
+                            Column(
+                                ColumnOptions::new()
+                                    .modifier(Modifier::empty().weight(1.0).fill_max_height()),
+                                || {
+                                    key(selected as u8, || match selected {
+                                        Screen::Overview => Overview(
+                                            tasks.clone(),
+                                            next_id.clone(),
+                                            filter.clone(),
+                                            list_scroll.clone(),
+                                        ),
+                                        Screen::StateLab => StateLab(note.clone(), counter.clone()),
+                                        Screen::ModifierLab => ModifierLab(),
+                                    });
+                                },
+                            );
                         },
                     );
                 },

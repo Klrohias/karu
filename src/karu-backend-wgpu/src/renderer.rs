@@ -19,6 +19,9 @@ pub struct WgpuBackend {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    msaa_sample_count: u32,
+    msaa_texture: Option<wgpu::Texture>,
+    msaa_view: Option<wgpu::TextureView>,
     scale_factor: f32,
     background: Color,
     shape_pipeline: wgpu::RenderPipeline,
@@ -204,6 +207,14 @@ impl WgpuBackend {
             .expect("adapter cannot configure the wgpu surface");
         config.present_mode = wgpu::PresentMode::AutoVsync;
         surface.configure(&device, &config);
+        let format_features = adapter.get_texture_format_features(config.format);
+        let msaa_sample_count = select_msaa_sample_count(
+            &format_features.flags.supported_sample_counts(),
+            format_features
+                .flags
+                .contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_RESOLVE),
+        );
+        let (msaa_texture, msaa_view) = create_msaa_target(&device, &config, msaa_sample_count);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("karu-wgpu-shader"),
@@ -283,7 +294,7 @@ impl WgpuBackend {
             },
             primitive: primitive_state(),
             depth_stencil: None,
-            multisample: Default::default(),
+            multisample: multisample_state(msaa_sample_count),
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("shape_fs"),
@@ -308,7 +319,7 @@ impl WgpuBackend {
             },
             primitive: primitive_state(),
             depth_stencil: None,
-            multisample: Default::default(),
+            multisample: multisample_state(msaa_sample_count),
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("text_fs"),
@@ -335,6 +346,9 @@ impl WgpuBackend {
             device,
             queue,
             config,
+            msaa_sample_count,
+            msaa_texture,
+            msaa_view,
             scale_factor,
             background,
             shape_pipeline,
@@ -383,6 +397,8 @@ impl WgpuBackend {
         );
         if surface_changed {
             self.surface.configure(&self.device, &self.config);
+            (self.msaa_texture, self.msaa_view) =
+                create_msaa_target(&self.device, &self.config, self.msaa_sample_count);
         }
     }
 
@@ -402,6 +418,8 @@ impl WgpuBackend {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+        let color_view = self.msaa_view.as_ref().unwrap_or(&view);
+        let resolve_target = (self.msaa_sample_count > 1).then_some(&view);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -463,9 +481,9 @@ impl WgpuBackend {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("karu-wgpu-render-pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &view,
+                view: color_view,
                 depth_slice: None,
-                resolve_target: None,
+                resolve_target,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(to_wgpu_color(self.background)),
                     store: wgpu::StoreOp::Store,
@@ -576,6 +594,50 @@ impl WgpuBackend {
         queue.submit(Some(encoder.finish()));
         frame.present();
     }
+}
+
+pub(crate) fn select_msaa_sample_count(
+    supported_sample_counts: &[u32],
+    resolve_supported: bool,
+) -> u32 {
+    (resolve_supported && supported_sample_counts.contains(&4))
+        .then_some(4)
+        .unwrap_or(1)
+}
+
+fn multisample_state(sample_count: u32) -> wgpu::MultisampleState {
+    wgpu::MultisampleState {
+        count: sample_count,
+        mask: !0,
+        alpha_to_coverage_enabled: false,
+    }
+}
+
+fn create_msaa_target(
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+    sample_count: u32,
+) -> (Option<wgpu::Texture>, Option<wgpu::TextureView>) {
+    if sample_count <= 1 {
+        return (None, None);
+    }
+
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("karu-wgpu-msaa-color"),
+        size: wgpu::Extent3d {
+            width: config.width.max(1),
+            height: config.height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count,
+        dimension: wgpu::TextureDimension::D2,
+        format: config.format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (Some(texture), Some(view))
 }
 
 impl TextResourceCache {

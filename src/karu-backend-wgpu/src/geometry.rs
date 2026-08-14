@@ -301,7 +301,6 @@ pub(crate) fn rounded_rect_vertices(rect: Rect, brush: &Brush, radius: f32) -> V
 }
 
 pub(crate) fn rounded_points(rect: Rect, radius: f32) -> Vec<[f32; 2]> {
-    const SEGMENTS: usize = 8;
     let radius = radius
         .max(0.0)
         .min(rect.size.width.min(rect.size.height) * 0.5);
@@ -312,20 +311,38 @@ pub(crate) fn rounded_points(rect: Rect, radius: f32) -> Vec<[f32; 2]> {
     let y = rect.origin.y;
     let right = x + rect.size.width;
     let bottom = y + rect.size.height;
+    let segments = rounded_corner_segments(radius);
     let corners = [
         (x + radius, y + radius, std::f32::consts::PI),
         (right - radius, y + radius, 1.5 * std::f32::consts::PI),
         (right - radius, bottom - radius, 0.0),
         (x + radius, bottom - radius, 0.5 * std::f32::consts::PI),
     ];
-    let mut points = Vec::with_capacity(SEGMENTS * 4);
+    let mut points = Vec::with_capacity(segments * 4);
     for (cx, cy, start) in corners {
-        for step in 0..SEGMENTS {
-            let angle = start + step as f32 * std::f32::consts::FRAC_PI_2 / SEGMENTS as f32;
+        for step in 0..segments {
+            let angle = start + step as f32 * std::f32::consts::FRAC_PI_2 / segments as f32;
             points.push([cx + radius * angle.cos(), cy + radius * angle.sin()]);
         }
     }
     points
+}
+
+pub(crate) fn rounded_corner_segments(radius: f32) -> usize {
+    const MIN_SEGMENTS: usize = 8;
+    const MAX_SEGMENTS: usize = 24;
+    const MAX_CHORD_ERROR: f32 = 0.25;
+
+    if radius <= 0.0 {
+        return MIN_SEGMENTS;
+    }
+    let angle = (1.0 - MAX_CHORD_ERROR / radius).clamp(-1.0, 1.0).acos();
+    if angle <= f32::EPSILON {
+        return MAX_SEGMENTS;
+    }
+    (std::f32::consts::FRAC_PI_2 / angle)
+        .ceil()
+        .clamp(MIN_SEGMENTS as f32, MAX_SEGMENTS as f32) as usize
 }
 
 pub(crate) fn brush_vertex(brush: &Brush, x: f32, y: f32) -> ShapeVertex {
@@ -392,6 +409,7 @@ pub(crate) fn stroke_vertices(
     }
     let mut vertices = Vec::new();
     let inner = (radius - width).max(0.0);
+    let segments = rounded_corner_segments(radius);
 
     extend_quad(
         &mut vertices,
@@ -432,9 +450,9 @@ pub(crate) fn stroke_vertices(
         (r - radius, b - radius, 0.0),
         (x + radius, b - radius, 0.5 * std::f32::consts::PI),
     ] {
-        for step in 0..8 {
-            let a0 = start + step as f32 * std::f32::consts::FRAC_PI_2 / 8.0;
-            let a1 = start + (step + 1) as f32 * std::f32::consts::FRAC_PI_2 / 8.0;
+        for step in 0..segments {
+            let a0 = start + step as f32 * std::f32::consts::FRAC_PI_2 / segments as f32;
+            let a1 = start + (step + 1) as f32 * std::f32::consts::FRAC_PI_2 / segments as f32;
             let outer0 = [cx + radius * a0.cos(), cy + radius * a0.sin()];
             let outer1 = [cx + radius * a1.cos(), cy + radius * a1.sin()];
             let inner0 = [cx + inner * a0.cos(), cy + inner * a0.sin()];
